@@ -1,0 +1,36 @@
+Bootstrap: docker
+From: ghcr.io/astral-sh/uv:0.5.1
+Stage: uv
+
+Bootstrap: docker
+From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+Stage: final
+
+%files from uv
+    /uv /bin/uv
+    /uvx /bin/uvx
+
+%files
+    pyproject.toml /app/pyproject.toml
+    uv.lock /app/uv.lock
+    packages/openpi-client/pyproject.toml /app/packages/openpi-client/pyproject.toml
+    packages/openpi-client/src /app/packages/openpi-client/src
+    src/openpi/models_pytorch/transformers_replace /tmp/transformers_replace
+
+%post
+    apt-get update && apt-get install -y git git-lfs linux-headers-generic build-essential clang
+    export UV_LINK_MODE=copy
+    export UV_PROJECT_ENVIRONMENT=/.venv
+    cd /app
+    uv venv --python 3.11.9 $UV_PROJECT_ENVIRONMENT
+    GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
+    /.venv/bin/python -c "import transformers; print(transformers.__file__)" | xargs dirname | xargs -I{} cp -r /tmp/transformers_replace/* {}
+    rm -rf /tmp/transformers_replace
+
+%environment
+    export UV_LINK_MODE=copy
+    export UV_PROJECT_ENVIRONMENT=/.venv
+    export PATH=/.venv/bin:/bin:$PATH
+
+%runscript
+    cd /app && uv run scripts/serve_policy.py "$@"
