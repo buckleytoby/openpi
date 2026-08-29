@@ -36,7 +36,16 @@
 # still letting sbatch pick it up automatically. Re-used below (as a plain
 # shell var) to build the /projects/$SBATCH_ACCOUNT/... paths too, since
 # Quest's convention is one /projects/<account> dir per allocation.
-for var in WANDB_API_KEY SBATCH_ACCOUNT; do
+#
+# OPENPI_REPO_DIR (absolute path to your openpi checkout on Quest, e.g.
+# "/home/bqt9019/dexnex/libraries/openpi") must also be exported. Do NOT try
+# to derive this from "$0" -- sbatch copies the submitted script into a
+# spool directory (/var/spool/...) and executes it from there, so "$0"
+# points at that spool copy, not this file's real location; a
+# "$(dirname "$0")/../.." trick resolves to garbage (this is exactly what
+# broke the first run: singularity looked for openpi_server.sif under
+# /var/spool instead of the repo).
+for var in WANDB_API_KEY SBATCH_ACCOUNT OPENPI_REPO_DIR; do
     if [ -z "${!var}" ]; then
         echo "$var is not set in the submitting shell's environment -- export it (e.g. in ~/.bashrc) before sbatch'ing this script." >&2
         exit 1
@@ -45,7 +54,7 @@ done
 
 module load singularityce/4.3.1-gcc-8.5.0
 
-cd "$(dirname "$0")/../.." || exit 1
+cd "$OPENPI_REPO_DIR" || exit 1
 
 singularity exec --nv --overlay /projects/$SBATCH_ACCOUNT/dexnex/overlay.img \
   --bind $PWD:/app \
