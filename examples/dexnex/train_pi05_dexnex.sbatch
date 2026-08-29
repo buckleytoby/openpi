@@ -3,7 +3,15 @@
 #SBATCH --partition=gengpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=12
-#SBATCH --mem=64G
+#SBATCH --mem=128G
+# 128G, not 64G: a run at 64G got oom_kill'd by Slurm right at the first
+# checkpoint save (step 1000) -- orbax's async checkpoint save transfers the
+# full training state (params+optimizer, ~25GB combined) to HOST memory,
+# which stacks on top of whatever the 8 dataloader workers + JAX/XLA host
+# buffers were already using, and that in-flight async-save buffer isn't
+# necessarily freed before the next step's work continues. This is host
+# (CPU) RAM getting oom_kill'd by Slurm's cgroup, a completely different
+# failure mode from the earlier GPU_0_bfc RESOURCE_EXHAUSTED (VRAM) OOM.
 #SBATCH --time=12:00:00
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
@@ -67,6 +75,6 @@ singularity exec --nv --overlay /projects/$SBATCH_ACCOUNT/dexnex/overlay.img \
   --pwd /app \
   openpi_server.sif \
   uv run scripts/train.py pi05_dexnex_erlenmeyer \
-    --exp-name=run1_h100_12h --overwrite \
+    --exp-name=run1_h100_12h --resume \
     --batch-size=32 --num-workers=8 \
     --num-train-steps=28000 --save-interval=1000
