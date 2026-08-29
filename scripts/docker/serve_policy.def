@@ -15,7 +15,6 @@ Stage: final
     uv.lock /app/uv.lock
     packages/openpi-client/pyproject.toml /app/packages/openpi-client/pyproject.toml
     packages/openpi-client/src /app/packages/openpi-client/src
-    src/openpi/models_pytorch/transformers_replace /tmp/transformers_replace
 
 %post
     apt-get update && apt-get install -y git git-lfs linux-headers-generic build-essential clang
@@ -24,8 +23,10 @@ Stage: final
     cd /app
     uv venv --python 3.11.9 $UV_PROJECT_ENVIRONMENT
     GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
-    /.venv/bin/python -c "import transformers; print(transformers.__file__)" | xargs dirname | xargs -I{} cp -r /tmp/transformers_replace/* {}
-    rm -rf /tmp/transformers_replace
+    # NOTE: unlike the Dockerfile, the transformers_replace patch is NOT applied at build
+    # time here -- copying the repo's src/ directory into the image via %files/%setup was
+    # unreliable in this multi-stage build. Since the repo is bind-mounted at /app at
+    # runtime anyway, apply the patch then instead (see scripts/docker/apply_transformers_patch.sh).
 
 %environment
     export UV_LINK_MODE=copy
