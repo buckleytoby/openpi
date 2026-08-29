@@ -23,6 +23,29 @@ Stage: final
     cd /app
     uv venv --python 3.11.9 $UV_PROJECT_ENVIRONMENT
     GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
+    # uv installs its managed Python interpreters under $HOME (/root during
+    # this %post build), which defaults to mode 700 -- /.venv/bin/python
+    # symlinks into /root/.local/share/uv/python/..., so at runtime a
+    # non-root Singularity user (Singularity, unlike Docker, runs as the
+    # invoking host user by default) can't even traverse /root to resolve
+    # that symlink, failing with "Permission denied" trying to canonicalize
+    # /.venv/bin/python3. 711 on /root allows traversal without directory
+    # listing; a+rX on /root/.local makes the actual interpreter files
+    # readable/executable by everyone.
+    chmod 711 /root
+    chmod -R a+rX /root/.local
+    # uv run's editable install of the local project (openpi/openpi-client,
+    # deliberately skipped above via --no-install-project since the repo is
+    # bind-mounted live at /app at runtime) rewrites *.pth files under
+    # /.venv/lib/python3.11/site-packages on every run. /.venv is created
+    # above while %post runs as root, so those directories default to
+    # root-only write permission -- a non-root Singularity user can't
+    # unlink/recreate files there even with --writable-tmpfs, since removing
+    # a file needs write permission on its containing directory, not just a
+    # writable filesystem. a+rwX makes every directory in the tree
+    # world-writable (and every file world-readable) without making regular
+    # files spuriously executable.
+    chmod -R a+rwX /.venv
     # NOTE: unlike the Dockerfile, the transformers_replace patch is NOT applied at build
     # time here -- copying the repo's src/ directory into the image via %files/%setup was
     # unreliable in this multi-stage build. Since the repo is bind-mounted at /app at

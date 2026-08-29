@@ -122,7 +122,7 @@ def main(
             # Episodes recorded before that have an all-zero env_image; this flag lets the
             # training pipeline mask env_image out for those episodes instead of treating
             # the zeros as real visual input.
-            "env_image_valid": {
+            "env_cam_valid": {
                 "dtype": "int64",
                 "shape": (1,),
                 "names": None,
@@ -151,7 +151,7 @@ def main(
 
             # env_image was not recorded for all episodes (see feature comment above) --
             # treat an episode as invalid for env_image if every pixel in the episode is zero.
-            env_image_valid = np.int64(0 if not np.any(env_images) else 1)
+            env_cam_valid = np.array([0 if not np.any(env_images) else 1], dtype=np.int64)
 
             pbar.set_postfix(episode=f"{episode_idx + 1}/{len(episode_ends)}")
             for i in range(end - start):
@@ -162,7 +162,7 @@ def main(
                         "overhead_image": overhead_images[i],
                         "state": state[i],
                         "actions": actions[i],
-                        "env_image_valid": env_image_valid,
+                        "env_cam_valid": env_cam_valid,
                         "task": task,
                     }
                 )

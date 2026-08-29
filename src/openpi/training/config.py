@@ -374,7 +374,7 @@ class LeRobotDexnexDataConfig(DataConfigFactory):
                         "observation/env_image": "env_image",
                         "observation/overhead_image": "overhead_image",
                         "observation/state": "state",
-                        "observation/env_image_valid": "env_image_valid",
+                        "observation/env_image_valid": "env_cam_valid",
                         "actions": "actions",
                         "prompt": "prompt",
                     }
