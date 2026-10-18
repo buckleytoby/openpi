@@ -362,6 +362,10 @@ class LeRobotDexnexDataConfig(DataConfigFactory):
     Config for the dexnex erlenmeyer-flask dataset (see examples/dexnex/convert_dexnex_data_to_lerobot.py).
     """
 
+    # The state values the model sees (DexnexInputs.state_dim): 10 with the BioTac tactile, 7 without
+    # (sim/real co-training: the sim has no tactile).
+    state_dim: int = 10
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # Match the dataset's column names (defined in the conversion script) to the keys
@@ -383,7 +387,7 @@ class LeRobotDexnexDataConfig(DataConfigFactory):
         )
 
         data_transforms = _transforms.Group(
-            inputs=[dexnex_policy.DexnexInputs(model_type=model_config.model_type)],
+            inputs=[dexnex_policy.DexnexInputs(model_type=model_config.model_type, state_dim=self.state_dim)],
             outputs=[dexnex_policy.DexnexOutputs()],
         )
 
@@ -812,6 +816,31 @@ _CONFIGS = [
         data=LeRobotDexnexDataConfig(
             repo_id="dexnex/task_24_erlenmeyer_flask",
             base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        # Sim/real co-training: the real erlenmeyer demos plus the SuperDex tree-exploration successes
+        # (aiet_grip, rendered to the real cameras: avatar_intelligence .../tree_exploration/sim_to_real.py), one
+        # combined dataset (examples/dexnex/convert_dexnex_data_to_lerobot.py --sim-paths ...; each sim episode
+        # once: ~25% of the frames); the same prompt for both (no domain marker); no tactile (state_dim 7).
+        # Otherwise pi05_dexnex_erlenmeyer's settings.
+        name="pi05_dexnex_erlenmeyer_cotrain",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotDexnexDataConfig(
+            repo_id="dexnex/task_24_erlenmeyer_flask_cotrain",
+            base_config=DataConfig(prompt_from_task=True),
+            state_dim=7,
         ),
         batch_size=128,
         lr_schedule=_optimizer.CosineDecaySchedule(

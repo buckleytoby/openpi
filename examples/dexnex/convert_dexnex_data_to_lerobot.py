@@ -22,6 +22,14 @@ HF_LEROBOT_HOME=/media/dexnex_ssd/datasets uv run examples/dexnex/convert_dexnex
     --task "pick up the pellet from the tray and place it in the erlenmeyer flask" \
     --fps 10
 
+Sim/real co-training (pi05_dexnex_erlenmeyer_cotrain): add the sim zarrs (same layout -- avatar_intelligence's
+tree_exploration/sim_to_real.py writes them, BioTac all zero) and the combined dataset's name:
+HF_LEROBOT_HOME=/media/dexnex_ssd/datasets uv run examples/dexnex/convert_dexnex_data_to_lerobot.py \
+    --repo-name dexnex/task_24_erlenmeyer_flask_cotrain \
+    --sim-paths /media/dexnex_ssd/datasets/aiet_grip_sim_to_real.zarr
+Each sim episode is written --sim-repeat times (1: the natural share); every frame carries `is_sim` (0 real, 1 sim:
+not a model input, for analysis / per-domain stats). Same prompt for both (no domain marker).
+
 If you want to push your dataset to the Hugging Face Hub, add --push_to_hub.
 
 The resulting dataset is saved to $HF_LEROBOT_HOME / <repo_name> (defaults to
@@ -56,34 +64,14 @@ def main(
     *,
     fps: int = 10,
     repo_name: str = REPO_NAME,
+    sim_paths: list[str] | None = None,
+    sim_repeat: int = 1,
     push_to_hub: bool = False,
 ):
     # Clean up any existing dataset in the output directory
     output_path = HF_LEROBOT_HOME / repo_name
     if output_path.exists():
         shutil.rmtree(output_path)
-
-    root = zarr.open(data_path, mode="r")
-    data = root["data"]
-    episode_ends = np.asarray(root["meta/episode_ends"])
-
-    num_steps = data["palm_pose_xyz_rpy_states"].shape[0]
-    for key in (
-        "env_image",
-        "wrist_image",
-        "overhead_image",
-        "palm_pose_xyz_rpy_commands",
-        "gripper_value_states",
-        "gripper_value_commands",
-        "biotac_lh",
-    ):
-        assert data[key].shape[0] == num_steps, (
-            f"Expected '{key}' to have {num_steps} rows (matching palm_pose_xyz_rpy_states), "
-            f"got {data[key].shape[0]}. If images are still being written by another script, wait for it to finish."
-        )
-    assert episode_ends[-1] == num_steps, (
-        f"meta/episode_ends last entry ({episode_ends[-1]}) does not match the number of timesteps ({num_steps})."
-    )
 
     # Create LeRobot dataset, define features to store
     # OpenPi assumes that proprio is stored in `state` and actions in `action`
@@ -127,14 +115,67 @@ def main(
                 "shape": (1,),
                 "names": None,
             },
+            # 0: a real demo, 1: a sim episode (co-training; not a model input)
+            "is_sim": {
+                "dtype": "int64",
+                "shape": (1,),
+                "names": None,
+            },
         },
         image_writer_threads=10,
         image_writer_processes=5,
     )
 
-    # Loop over episodes (defined by meta/episode_ends) and write frames to the LeRobot dataset
+    sources = [(data_path, 0, 1)] + [(path, 1, sim_repeat) for path in (sim_paths or [])]
+    totals = {0: 0, 1: 0}
+    for path, is_sim, repeat in sources:
+        for _ in range(repeat):
+            totals[is_sim] += _write_zarr(dataset, path, task, is_sim)
+    if sim_paths:
+        print(f"frames: {totals[0]} real, {totals[1]} sim ({100 * totals[1] / max(totals[0] + totals[1], 1):.1f}% sim)")
+
+    # Optionally push to the Hugging Face Hub
+    if push_to_hub:
+        dataset.push_to_hub(
+            tags=["dexnex", "gofa1", "shadow_hand"],
+            private=True,
+            push_videos=True,
+            license="apache-2.0",
+        )
+
+
+def _open_zarr(path: str):
+    """The zarr's data group and episode ends, checked (every array as long as the timeline, episode_ends matching)."""
+    root = zarr.open(path, mode="r")
+    data = root["data"]
+    episode_ends = np.asarray(root["meta/episode_ends"])
+
+    num_steps = data["palm_pose_xyz_rpy_states"].shape[0]
+    for key in (
+        "env_image",
+        "wrist_image",
+        "overhead_image",
+        "palm_pose_xyz_rpy_commands",
+        "gripper_value_states",
+        "gripper_value_commands",
+        "biotac_lh",
+    ):
+        assert data[key].shape[0] == num_steps, (
+            f"{path}: expected '{key}' to have {num_steps} rows (matching palm_pose_xyz_rpy_states), "
+            f"got {data[key].shape[0]}. If images are still being written by another script, wait for it to finish."
+        )
+    assert episode_ends[-1] == num_steps, (
+        f"{path}: meta/episode_ends last entry ({episode_ends[-1]}) does not match the number of timesteps ({num_steps})."
+    )
+    return data, episode_ends
+
+
+def _write_zarr(dataset, path: str, task: str, is_sim: int) -> int:
+    """Every episode of the zarr at ``path`` into ``dataset`` (one LeRobot episode each); returns its frame count."""
+    data, episode_ends = _open_zarr(path)
+    num_steps = int(episode_ends[-1])
     start = 0
-    with tqdm.tqdm(total=num_steps, desc="Converting frames", unit="frame") as pbar:
+    with tqdm.tqdm(total=num_steps, desc=f"Converting {'sim' if is_sim else 'real'} frames", unit="frame") as pbar:
         for episode_idx, end in enumerate(episode_ends):
             end = int(end)
             palm_states = data["palm_pose_xyz_rpy_states"][start:end]
@@ -163,21 +204,18 @@ def main(
                         "state": state[i],
                         "actions": actions[i],
                         "env_cam_valid": env_cam_valid,
+                        "is_sim": np.array([is_sim], dtype=np.int64),
                         "task": task,
                     }
                 )
                 pbar.update(1)
             dataset.save_episode()
+            # LeRobot keeps every saved episode, images embedded, in dataset.hf_dataset (save_episode's
+            # concatenate_datasets): ~38 GB of RAM by 230k frames (the real + sim dataset got OOM-killed). Each
+            # episode is already on disk as its parquet, and nothing here reads it back: start it empty again.
+            dataset.hf_dataset = dataset.create_hf_dataset()
             start = end
-
-    # Optionally push to the Hugging Face Hub
-    if push_to_hub:
-        dataset.push_to_hub(
-            tags=["dexnex", "gofa1", "shadow_hand"],
-            private=True,
-            push_videos=True,
-            license="apache-2.0",
-        )
+    return num_steps
 
 
 if __name__ == "__main__":

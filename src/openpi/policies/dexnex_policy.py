@@ -40,12 +40,16 @@ class DexnexInputs(transforms.DataTransformFn):
       - overhead_image -> right_wrist_0_rgb
 
     `state` is 10-dim: 6D palm pose (xyz + rpy) + 1D gripper value + 3D biotac tactile
-    (thumb, index, middle).
+    (thumb, index, middle). Only its first `state_dim` values reach the model: 7 drops the
+    tactile (sim/real co-training: the sim has no BioTac -- its dataset rows hold zeros there);
+    the inference node can keep sending all 10.
     """
 
     # Determines which model will be used.
     # Do not change this for your own dataset.
     model_type: _model.ModelType
+    # 10: palm pose + gripper + biotac; 7: palm pose + gripper (no tactile)
+    state_dim: int = 10
 
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/env_image"])
@@ -59,7 +63,7 @@ class DexnexInputs(transforms.DataTransformFn):
         env_image_valid = bool(data.get("observation/env_image_valid", True))
 
         inputs = {
-            "state": data["observation/state"],
+            "state": np.asarray(data["observation/state"])[..., : self.state_dim],
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": left_wrist_image,

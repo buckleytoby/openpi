@@ -8,6 +8,12 @@ import websockets.sync.client
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 
+# Must match openpi.serving.websocket_policy_server.CONTROL_KEY exactly --
+# duplicated (not imported) since openpi_client is a deliberately lightweight
+# package (see packages/openpi-client/pyproject.toml) that shouldn't pull in
+# the full openpi package's heavy deps just for one string constant.
+_CONTROL_KEY = "__control__"
+
 
 class WebsocketClientPolicy(_base_policy.BasePolicy):
     """Implements the Policy interface by communicating with a server over websocket.
@@ -50,6 +56,22 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         response = self._ws.recv()
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        return msgpack_numpy.unpackb(response)
+
+    def send_control(self, command: Dict) -> Dict:  # noqa: UP006
+        """Send a control command (e.g. {"cmd": "load_checkpoint", ...}) to a
+        server that supports WebsocketPolicyServer's on_control handler --
+        used for out-of-band operations like hot-swapping the served policy,
+        distinct from a normal infer() call. Returns the server's response
+        dict as-is (server-defined shape, e.g. {"success": bool, "message":
+        str, ...}). Raises RuntimeError if the server has no control handler
+        configured, or on any other server-side error (same convention as
+        infer())."""
+        data = self._packer.pack({_CONTROL_KEY: command})
+        self._ws.send(data)
+        response = self._ws.recv()
+        if isinstance(response, str):
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)
 

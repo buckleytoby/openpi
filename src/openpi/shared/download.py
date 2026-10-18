@@ -129,9 +129,19 @@ def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
         total_size = fs.du(url)
     else:
         total_size = info["size"]
+    # For directories, mirror _download_gsutil's f"{url}/*" glob convention:
+    # fs.get(url, local_path, recursive=True) with a bare (non-glob) url
+    # copies the SOURCE DIRECTORY ITSELF as a subdirectory into local_path
+    # (e.g. local_path/pi05_base/params/... instead of local_path/params/...),
+    # unlike gsutil's "cp -r url/*" which copies url's CONTENTS directly into
+    # local_path. Appending "/*" here makes fsspec's recursive get copy
+    # contents the same way, so callers (e.g. model.restore_params expecting
+    # local_path/params/_METADATA directly, not local_path/<name>/params/...)
+    # see identical layouts regardless of which download path was taken.
+    get_url = f"{url}/*" if is_dir else url
     with tqdm.tqdm(total=total_size, unit="iB", unit_scale=True, unit_divisor=1024) as pbar:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(fs.get, url, local_path, recursive=is_dir)
+        future = executor.submit(fs.get, get_url, local_path, recursive=is_dir)
         while not future.done():
             current_size = sum(f.stat().st_size for f in [*local_path.rglob("*"), local_path] if f.is_file())
             pbar.update(current_size - pbar.n)
