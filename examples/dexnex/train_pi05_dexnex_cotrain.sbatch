@@ -36,11 +36,18 @@ module load singularityce/4.3.1-gcc-8.5.0
 
 cd "$OPENPI_REPO_DIR" || exit 1
 
+# LeRobot's load_dataset("parquet") first writes an Arrow copy of the whole dataset (~34 GB) into the HF datasets
+# cache -- by default ~/.cache/huggingface/datasets, i.e. the Quest home directory, whose quota it overflows
+# ("OSError: [Errno 122] Disk quota exceeded", job 4350183). Keep that cache on scratch instead.
+mkdir -p /scratch/$USER/hf_datasets_cache
+
 singularity exec --nv --overlay /projects/$SBATCH_ACCOUNT/dexnex/overlay.img \
   --bind $PWD:/app \
   --bind /projects/$SBATCH_ACCOUNT/dexnex/task_24_erlenmeyer_flask_cotrain:/data/my_dataset/dexnex/task_24_erlenmeyer_flask_cotrain \
   --bind /scratch/$USER/openpi_cache:/openpi_assets \
+  --bind /scratch/$USER/hf_datasets_cache:/hf_datasets_cache \
   --env HF_LEROBOT_HOME=/data/my_dataset \
+  --env HF_DATASETS_CACHE=/hf_datasets_cache \
   --env OPENPI_DATA_HOME=/openpi_assets \
   --env XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
   --env WANDB_API_KEY=$WANDB_API_KEY \
