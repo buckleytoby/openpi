@@ -30,6 +30,11 @@ HF_LEROBOT_HOME=/media/dexnex_ssd/datasets uv run examples/dexnex/convert_dexnex
 Each sim episode is written --sim-repeat times (1: the natural share); every frame carries `is_sim` (0 real, 1 sim:
 not a model input, for analysis / per-domain stats). Same prompt for both (no domain marker).
 
+--append: add only what's new to an existing dataset instead of rebuilding it -- the episodes of each zarr past those
+already converted (meta/converted_sources.json: per source zarr, its episodes done; zarrs are append-only, so new
+episodes are the last ones). A dataset made before that file existed: inferred (the real zarr's episodes first, then
+the sim ones), printed. Then recompute the norm stats (scripts/compute_norm_stats.py).
+
 If you want to push your dataset to the Hugging Face Hub, add --push_to_hub.
 
 The resulting dataset is saved to $HF_LEROBOT_HOME / <repo_name> (defaults to
@@ -66,10 +71,24 @@ def main(
     repo_name: str = REPO_NAME,
     sim_paths: list[str] | None = None,
     sim_repeat: int = 1,
+    append: bool = False,
     push_to_hub: bool = False,
 ):
-    # Clean up any existing dataset in the output directory
     output_path = HF_LEROBOT_HOME / repo_name
+    sources = [(data_path, 0, 1)] + [(path, 1, sim_repeat) for path in (sim_paths or [])]
+    if append and output_path.exists():
+        dataset = _open_for_append(repo_name)
+        done = _converted_sources(output_path, dataset.meta.total_episodes, sources)
+        totals = {0: 0, 1: 0}
+        for path, is_sim, repeat in sources:
+            for _ in range(repeat):
+                totals[is_sim] += _write_zarr(dataset, path, task, is_sim, start_episode=done.get(path, 0))
+            done[path] = _num_episodes(path)
+            _save_converted(output_path, done)
+        _summary(output_path, totals, appended=True)
+        return
+
+    # Clean up any existing dataset in the output directory
     if output_path.exists():
         shutil.rmtree(output_path)
 
@@ -126,13 +145,14 @@ def main(
         image_writer_processes=5,
     )
 
-    sources = [(data_path, 0, 1)] + [(path, 1, sim_repeat) for path in (sim_paths or [])]
     totals = {0: 0, 1: 0}
+    done = {}
     for path, is_sim, repeat in sources:
         for _ in range(repeat):
             totals[is_sim] += _write_zarr(dataset, path, task, is_sim)
-    if sim_paths:
-        print(f"frames: {totals[0]} real, {totals[1]} sim ({100 * totals[1] / max(totals[0] + totals[1], 1):.1f}% sim)")
+        done[path] = _num_episodes(path)
+        _save_converted(output_path, done)
+    _summary(output_path, totals, appended=False)
 
     # Optionally push to the Hugging Face Hub
     if push_to_hub:
@@ -170,13 +190,88 @@ def _open_zarr(path: str):
     return data, episode_ends
 
 
-def _write_zarr(dataset, path: str, task: str, is_sim: int) -> int:
-    """Every episode of the zarr at ``path`` into ``dataset`` (one LeRobot episode each); returns its frame count."""
+def _summary(output_path, totals: dict, appended: bool) -> None:
+    """The run's summary: frames written now (real / sim), and the whole dataset's real / sim episodes and frames (its
+    episodes in the order this script writes them: each source zarr's, as meta/converted_sources.json records)."""
+    import json
+
+    lengths = [json.loads(line)["length"] for line in open(output_path / "meta" / "episodes.jsonl")]
+    done = json.loads((output_path / "meta" / "converted_sources.json").read_text())
+    real_episodes = next(iter(done.values()), 0)  # (the real zarr: written first)
+    real, sim = lengths[:real_episodes], lengths[real_episodes:]
+    total = max(sum(lengths), 1)
+    print(f"\n==== LeRobot dataset {'append' if appended else 'build'}: {output_path}")
+    print(f"written now: {totals[0]} real frames, {totals[1]} sim frames")
+    print(f"the dataset: {len(lengths)} episodes, {sum(lengths)} frames")
+    print(f"  real {len(real):5d} episodes {sum(real):7d} frames ({100 * sum(real) / total:.1f}%)")
+    print(f"  sim  {len(sim):5d} episodes {sum(sim):7d} frames ({100 * sum(sim) / total:.1f}%)  -- real : sim = "
+          f"{sum(real) / max(sum(sim), 1):.2f} : 1")
+    for path, count in done.items():
+        print(f"  from {path}: {count} episodes")
+    print("next: recompute the norm stats (scripts/compute_norm_stats.py), then rsync the dataset and assets to Quest")
+    print("====", flush=True)
+
+
+def _open_for_append(repo_name: str):
+    """An existing LeRobot dataset, ready for add_frame / save_episode -- LeRobotDataset.create's setup on the existing
+    metadata, without loading its data (LeRobotDataset(repo) would build the whole Arrow cache first)."""
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from lerobot.common.datasets.video_utils import get_safe_default_codec
+
+    obj = LeRobotDataset.__new__(LeRobotDataset)
+    obj.meta = LeRobotDatasetMetadata(repo_name, HF_LEROBOT_HOME / repo_name)
+    obj.repo_id, obj.root, obj.revision, obj.tolerance_s = obj.meta.repo_id, obj.meta.root, None, 1e-4
+    obj.image_writer = None
+    obj.start_image_writer(5, 10)
+    obj.episode_buffer = obj.create_episode_buffer()
+    obj.episodes, obj.image_transforms, obj.delta_timestamps, obj.delta_indices, obj.episode_data_index = None, None, None, None, None
+    obj.hf_dataset = obj.create_hf_dataset()
+    obj.video_backend = get_safe_default_codec()
+    return obj
+
+
+def _num_episodes(path: str) -> int:
+    return len(np.asarray(zarr.open(path, mode="r")["meta/episode_ends"]))
+
+
+def _save_converted(output_path, done: dict) -> None:
+    import json
+
+    (output_path / "meta" / "converted_sources.json").write_text(json.dumps(done, indent=1))
+
+
+def _converted_sources(output_path, total_episodes: int, sources: list) -> dict:
+    """Per source zarr, its episodes already in the dataset: meta/converted_sources.json, else inferred (the sources in
+    order, each fully converted while the dataset's episode count allows -- how this script wrote them)."""
+    import json
+
+    record = output_path / "meta" / "converted_sources.json"
+    if record.exists():
+        return json.loads(record.read_text())
+    done, left = {}, total_episodes
+    for path, _, repeat in sources:
+        count = min(_num_episodes(path), left // max(repeat, 1))
+        done[path] = count
+        left -= count * repeat
+    print(f"no {record.name}: inferred from the dataset's {total_episodes} episodes -- {done}")
+    if left:
+        raise SystemExit(f"{left} episodes unaccounted for: not this script's real + sim layout; rebuild instead (no --append)")
+    return done
+
+
+def _write_zarr(dataset, path: str, task: str, is_sim: int, start_episode: int = 0) -> int:
+    """The episodes of the zarr at ``path`` from ``start_episode`` on into ``dataset`` (one LeRobot episode each);
+    returns their frame count."""
     data, episode_ends = _open_zarr(path)
-    num_steps = int(episode_ends[-1])
-    start = 0
+    start = int(episode_ends[start_episode - 1]) if start_episode > 0 else 0
+    num_steps = int(episode_ends[-1]) - start
+    if num_steps <= 0:
+        print(f"{path}: nothing new ({start_episode} episodes already converted)")
+        return 0
     with tqdm.tqdm(total=num_steps, desc=f"Converting {'sim' if is_sim else 'real'} frames", unit="frame") as pbar:
         for episode_idx, end in enumerate(episode_ends):
+            if episode_idx < start_episode:
+                continue
             end = int(end)
             palm_states = data["palm_pose_xyz_rpy_states"][start:end]
             gripper_states = data["gripper_value_states"][start:end]

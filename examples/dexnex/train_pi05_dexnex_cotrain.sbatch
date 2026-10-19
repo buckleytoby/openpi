@@ -36,6 +36,12 @@ module load singularityce/4.3.1-gcc-8.5.0
 
 cd "$OPENPI_REPO_DIR" || exit 1
 
+# Continuing a finished run on a grown dataset: the same --exp-name with --resume picks up its latest checkpoint (weights,
+# optimizer, EMA; the data loader isn't restored -- the current dataset is used) and trains to NUM_TRAIN_STEPS (total,
+# not additional): e.g. NUM_TRAIN_STEPS=55998 sbatch ... runs 27999 -> 55997 (another 27,999 steps, ~12 h on an H100).
+# pi05_dexnex_erlenmeyer_cotrain's learning rate is constant after warmup (peak = decay = 5e-5), so going past its
+# 30k decay_steps changes nothing.
+
 # LeRobot's load_dataset("parquet") first writes an Arrow copy of the whole dataset (~34 GB) into the HF datasets
 # cache -- by default ~/.cache/huggingface/datasets, i.e. the Quest home directory, whose quota it overflows
 # ("OSError: [Errno 122] Disk quota exceeded", job 4350183). Keep that cache on scratch instead.
@@ -56,4 +62,4 @@ singularity exec --nv --overlay /projects/$SBATCH_ACCOUNT/dexnex/overlay.img \
   uv run scripts/train.py pi05_dexnex_erlenmeyer_cotrain \
     --exp-name=cotrain1_h100_12h --resume \
     --batch-size=32 --num-workers=8 \
-    --num-train-steps=28000 --save-interval=1000
+    --num-train-steps=${NUM_TRAIN_STEPS:-28000} --save-interval=1000
