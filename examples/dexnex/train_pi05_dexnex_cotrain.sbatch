@@ -42,6 +42,11 @@ cd "$OPENPI_REPO_DIR" || exit 1
 # pi05_dexnex_erlenmeyer_cotrain's learning rate is constant after warmup (peak = decay = 5e-5), so going past its
 # 30k decay_steps changes nothing.
 
+# CONFIG / EXP_NAME: another config of the same dataset, e.g. the balanced one (pi05_dexnex_erlenmeyer_cotrain_balanced:
+# per-source batch shares, started from the run above's step 55997):
+#   CONFIG=pi05_dexnex_erlenmeyer_cotrain_balanced EXP_NAME=balanced1_h100_12h sbatch ...
+# (--resume with no checkpoint yet starts it fresh; its norm stats: assets/pi05_dexnex_erlenmeyer_cotrain_balanced/...)
+
 # LeRobot's load_dataset("parquet") first writes an Arrow copy of the whole dataset (~34 GB) into the HF datasets
 # cache -- by default ~/.cache/huggingface/datasets, i.e. the Quest home directory, whose quota it overflows
 # ("OSError: [Errno 122] Disk quota exceeded", job 4350183). Keep that cache on scratch instead.
@@ -59,7 +64,7 @@ singularity exec --nv --overlay /projects/$SBATCH_ACCOUNT/dexnex/overlay.img \
   --env WANDB_API_KEY=$WANDB_API_KEY \
   --pwd /app \
   openpi_server.sif \
-  uv run scripts/train.py pi05_dexnex_erlenmeyer_cotrain \
-    --exp-name=cotrain1_h100_12h --resume \
+  uv run scripts/train.py ${CONFIG:-pi05_dexnex_erlenmeyer_cotrain} \
+    --exp-name=${EXP_NAME:-cotrain1_h100_12h} --resume \
     --batch-size=32 --num-workers=8 \
     --num-train-steps=${NUM_TRAIN_STEPS:-28000} --save-interval=1000

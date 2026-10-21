@@ -838,7 +838,7 @@ _CONFIGS = [
     TrainConfig(
         # pi05_dexnex_erlenmeyer_cotrain with fixed per-source batch shares (DataConfig.source_weights): half real, a
         # quarter aiet_grip (the full sim successes), a quarter aiet_grip_lift (sim successes ending at the lift: the
-        # grasp alignment). The dataset needs all three sources converted (convert_dexnex_data_to_lerobot.py --append
+        # grasp alignment), fine-tuned from pi05_dexnex_erlenmeyer_cotrain's step 55997. The dataset needs all three sources converted (convert_dexnex_data_to_lerobot.py --append
         # --sim-paths .../aiet_grip_sim_to_real.zarr .../aiet_grip_lift_sim_to_real.zarr) and this config's norm stats.
         name="pi05_dexnex_erlenmeyer_cotrain_balanced",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
@@ -859,7 +859,11 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # (started from the unbalanced co-train run's step 55997 -- the path inside the Quest container, where the repo is
+        # /app: train_pi05_dexnex_cotrain.sbatch; elsewhere, pi05_base: gs://openpi-assets/checkpoints/pi05_base/params)
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/app/checkpoints/pi05_dexnex_erlenmeyer_cotrain/cotrain1_h100_12h/55997/params"
+        ),
         num_train_steps=30_000,
     ),
     TrainConfig(
