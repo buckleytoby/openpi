@@ -61,13 +61,17 @@ class Policy(BasePolicy):
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            self._sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=("num_samples",))
             self._rng = rng or jax.random.key(0)
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        # (dexnex) "__num_samples": N > 1 samples N action chunks for this one observation in one call -- the model
+        # encodes the observation's prefix once and denoises N independent noise samples as a batch (Pi0.sample_actions'
+        # num_samples); "actions" is then [N, H, D].
+        num_samples = int(inputs.pop("__num_samples", 1))
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -75,11 +79,13 @@ class Policy(BasePolicy):
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
-            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...].repeat_interleave(num_samples, 0), inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        if num_samples > 1 and not self._is_pytorch_model:
+            sample_kwargs["num_samples"] = num_samples
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
@@ -94,12 +100,15 @@ class Policy(BasePolicy):
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
         model_time = time.monotonic() - start_time
-        if self._is_pytorch_model:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
-        else:
-            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
-
-        outputs = self._output_transform(outputs)
+        to_np = (lambda x: np.asarray(x.detach().cpu())) if self._is_pytorch_model else np.asarray
+        batched = jax.tree.map(to_np, outputs)
+        if num_samples == 1:
+            outputs = self._output_transform(jax.tree.map(lambda x: x[0, ...], batched))
+        else:  # (the output transform is per sample: unnormalize etc.; "state" stays the one observation's)
+            state = batched["state"]
+            per = [self._output_transform({"state": state[min(i, len(state) - 1)], "actions": batched["actions"][i]})
+                   for i in range(num_samples)]
+            outputs = {"actions": np.stack([p["actions"] for p in per])}
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

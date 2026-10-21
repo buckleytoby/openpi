@@ -78,6 +78,9 @@ class WebsocketPolicyServer:
             compression=None,
             max_size=None,
             process_request=_health_check,
+            # (dexnex) no keepalive pings: inference runs inside this event loop, so a long JAX compile (e.g. the first
+            # call with a new __num_samples) can't answer them and the client would drop the connection
+            ping_interval=None,
         ) as server:
             await server.serve_forever()
 

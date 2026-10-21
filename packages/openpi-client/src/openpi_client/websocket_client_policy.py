@@ -3,6 +3,7 @@ import time
 from typing import Dict, Optional, Tuple
 
 from typing_extensions import override
+import websockets.exceptions
 import websockets.sync.client
 
 from openpi_client import base_policy as _base_policy
@@ -41,7 +42,8 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri, compression=None, max_size=None, additional_headers=headers,
+                    ping_interval=None,  # (dexnex: a long server-side compile can't answer pings -- see the server)
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
@@ -52,8 +54,14 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
         data = self._packer.pack(obs)
-        self._ws.send(data)
-        response = self._ws.recv()
+        try:
+            self._ws.send(data)
+            response = self._ws.recv()
+        except websockets.exceptions.ConnectionClosed:  # (dexnex: reconnect and retry once instead of failing forever)
+            logging.warning("openpi server connection closed: reconnecting")
+            self._ws, self._server_metadata = self._wait_for_server()
+            self._ws.send(data)
+            response = self._ws.recv()
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")

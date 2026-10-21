@@ -151,6 +151,43 @@ def create_torch_dataset(
     return dataset
 
 
+def source_weighted_sampler(
+    data_config: _config.DataConfig, num_samples: int, seed: int = 0
+) -> torch.utils.data.WeightedRandomSampler:
+    """Frames drawn with replacement so each source (meta/episode_sources.json: each episode's label) makes up its
+    DataConfig.source_weights share of every batch (on average: each frame weighted by its source's share / the
+    source's frame count). Index i: the LeRobot dataset's frame i (episodes in order, as it loads them)."""
+    import json
+
+    meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+    record = meta.root / "meta" / "episode_sources.json"
+    if not record.exists():
+        raise FileNotFoundError(f"{record}: no per-episode source labels (source_weights needs them) -- re-run "
+                                "examples/dexnex/convert_dexnex_data_to_lerobot.py --append to write them")
+    labels = json.loads(record.read_text())
+    lengths = [meta.episodes[i]["length"] for i in range(meta.total_episodes)]
+    if len(labels) != len(lengths):
+        raise ValueError(f"{record}: {len(labels)} labels for {len(lengths)} episodes")
+    if sum(lengths) != num_samples:
+        raise ValueError(f"the episodes' lengths add up to {sum(lengths)} frames, the dataset has {num_samples}")
+    shares = dict(data_config.source_weights)
+    frames = {label: sum(n for n, l in zip(lengths, labels) if l == label) for label in dict.fromkeys(labels)}
+    missing = [label for label, share in shares.items() if share > 0 and not frames.get(label)]
+    if missing:
+        raise ValueError(f"source_weights {shares}: no frames of {missing} in the dataset (its sources: {frames})")
+    total = sum(shares.get(label, 0.0) for label in frames)
+    weights = np.concatenate([np.full(n, shares.get(l, 0.0) / total / frames[l]) for n, l in zip(lengths, labels)])
+    for label, n in frames.items():
+        share = shares.get(label, 0.0) / total
+        logging.info(f"source {label!r}: {n} frames ({100 * n / num_samples:.1f}% of the dataset) -> {100 * share:.1f}% "
+                     f"of each batch" + (f" (each frame ~{share * num_samples / n:.2f}x as often as uniform)" if share else " (not sampled)"))
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double), num_samples=num_samples, replacement=True, generator=generator
+    )
+
+
 def create_rlds_dataset(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -320,6 +357,10 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+    if data_config.source_weights is not None:
+        if sampler is not None:
+            raise NotImplementedError("source_weights with PyTorch DDP (its DistributedSampler) isn't supported")
+        sampler = source_weighted_sampler(data_config, len(dataset), seed)  # (shuffled: it draws at random)
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(

@@ -91,6 +91,12 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Per-source shares of every batch (LeRobot datasets with meta/episode_sources.json -- each episode's source label,
+    # examples/dexnex/convert_dexnex_data_to_lerobot.py), e.g. {"real": 0.5, "aiet_grip": 0.25, "aiet_grip_lift": 0.25}:
+    # frames drawn with replacement, each weighted by its source's share / that source's frame count (the shares hold
+    # whatever each source's size). A source left out isn't sampled. None: uniform over the frames.
+    source_weights: dict[str, float] | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -816,6 +822,33 @@ _CONFIGS = [
         data=LeRobotDexnexDataConfig(
             repo_id="dexnex/task_24_erlenmeyer_flask",
             base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        # pi05_dexnex_erlenmeyer_cotrain with fixed per-source batch shares (DataConfig.source_weights): half real, a
+        # quarter aiet_grip (the full sim successes), a quarter aiet_grip_lift (sim successes ending at the lift: the
+        # grasp alignment). The dataset needs all three sources converted (convert_dexnex_data_to_lerobot.py --append
+        # --sim-paths .../aiet_grip_sim_to_real.zarr .../aiet_grip_lift_sim_to_real.zarr) and this config's norm stats.
+        name="pi05_dexnex_erlenmeyer_cotrain_balanced",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotDexnexDataConfig(
+            repo_id="dexnex/task_24_erlenmeyer_flask_cotrain",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                source_weights={"real": 0.5, "aiet_grip": 0.25, "aiet_grip_lift": 0.25},
+            ),
+            state_dim=7,
         ),
         batch_size=128,
         lr_schedule=_optimizer.CosineDecaySchedule(
