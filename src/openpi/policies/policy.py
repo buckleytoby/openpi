@@ -50,6 +50,9 @@ class Policy(BasePolicy):
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
+        # (dexnex: the actions' normalization, for "__step_offset" -- an offset given in the action units)
+        unnorm = [t for t in output_transforms if isinstance(t, _transforms.Unnormalize)]
+        self._action_norm = ((unnorm[0].norm_stats or {}).get("actions"), unnorm[0].use_quantiles) if unnorm else (None, False)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
@@ -61,7 +64,7 @@ class Policy(BasePolicy):
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=("num_samples",))
+            self._sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=("num_samples", "offset_steps"))
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -72,6 +75,17 @@ class Policy(BasePolicy):
         # encodes the observation's prefix once and denoises N independent noise samples as a batch (Pi0.sample_actions'
         # num_samples); "actions" is then [N, H, D].
         num_samples = int(inputs.pop("__num_samples", 1))
+        # (dexnex) "__noise": the denoising's starting noise [N, H, D_model] (e.g. a returned "__noise", to re-denoise the
+        # same sample); "__step_offset" [H, d] in the action units (d <= D_model: the first d dims) with "__offset_steps"
+        # k: added in shares over the last k denoising steps (Pi0.sample_actions' step_offset). The noise used is
+        # returned as "__noise".
+        given_noise = inputs.pop("__noise", None)
+        step_offset = inputs.pop("__step_offset", None)
+        offset_steps = int(inputs.pop("__offset_steps", 0))
+        # (dexnex: the drawn starting noise x this -- wider candidates; one value, or one per sample [num_samples])
+        noise_temperature = np.asarray(inputs.pop("__noise_temperature", 1.0), dtype=np.float32).reshape(-1)
+        if given_noise is not None and noise is None:
+            noise = np.asarray(given_noise, dtype=np.float32)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -86,6 +100,16 @@ class Policy(BasePolicy):
         sample_kwargs = dict(self._sample_kwargs)
         if num_samples > 1 and not self._is_pytorch_model:
             sample_kwargs["num_samples"] = num_samples
+        if noise is None and not self._is_pytorch_model:  # (drawn here, so it can be returned)
+            self._rng, noise_rng = jax.random.split(self._rng)
+            noise = np.asarray(jax.random.normal(noise_rng, (num_samples, self._model.action_horizon, self._model.action_dim)))
+            if noise_temperature.size not in (1, num_samples):
+                raise ValueError(f"__noise_temperature: {noise_temperature.size} values for {num_samples} samples")
+            noise = noise * (noise_temperature[:, None, None] if noise_temperature.size > 1 else noise_temperature[0])
+        used_noise = None if noise is None else np.asarray(noise, dtype=np.float32).reshape(-1, *np.shape(noise)[-2:])
+        if step_offset is not None and offset_steps > 0 and not self._is_pytorch_model:
+            sample_kwargs["step_offset"] = jnp.asarray(self._offset_to_model(np.asarray(step_offset, np.float32), num_samples))
+            sample_kwargs["offset_steps"] = offset_steps
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
@@ -112,7 +136,21 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        if used_noise is not None:
+            outputs["__noise"] = used_noise
         return outputs
+
+    def _offset_to_model(self, offset: np.ndarray, num_samples: int) -> np.ndarray:
+        """An offset [H, d] in the action units -> the model's normalized action space [num_samples, H, D_model] (a
+        difference: only the normalization's scale applies -- 2 / (q99 - q01) or 1 / std)."""
+        stats, quantiles = self._action_norm
+        if stats is None:
+            raise ValueError("__step_offset: no action normalization stats in the policy")
+        d = offset.shape[-1]
+        scale = 2.0 / (np.asarray(stats.q99)[:d] - np.asarray(stats.q01)[:d] + 1e-6) if quantiles else 1.0 / (np.asarray(stats.std)[:d] + 1e-6)
+        full = np.zeros((num_samples, self._model.action_horizon, self._model.action_dim), np.float32)
+        full[:, : offset.shape[0], :d] = offset * scale
+        return full
 
     @property
     def metadata(self) -> dict[str, Any]:

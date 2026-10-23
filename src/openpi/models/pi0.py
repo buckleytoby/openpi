@@ -222,10 +222,16 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         num_samples: int = 1,
+        step_offset: at.Float[at.Array, "b ah ad"] | None = None,
+        offset_steps: int = 0,
     ) -> _model.Actions:
         """num_samples > 1 (dexnex; static under jit): num_samples action chunks per observation, the prefix (images +
         prompt -- the expensive part) encoded ONCE and its KV cache shared; only the denoising runs at batch
-        b * num_samples. Returns [b * num_samples, ah, ad] (each observation's samples consecutive)."""
+        b * num_samples. Returns [b * num_samples, ah, ad] (each observation's samples consecutive).
+
+        step_offset (dexnex; with offset_steps > 0, static): an offset in the model's (normalized) action space added
+        to the action in equal shares at each of the last offset_steps denoising steps -- BEFORE that step's velocity
+        is computed, so the model always makes the final update (the rlhf residual, steering the denoising)."""
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -247,6 +253,9 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
+            if step_offset is not None and offset_steps > 0:  # (the last offset_steps steps: start times k/n .. 1/n)
+                in_window = time <= offset_steps / num_steps + 1e-4
+                x_t = x_t + jnp.where(in_window, step_offset / offset_steps, 0.0)
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
