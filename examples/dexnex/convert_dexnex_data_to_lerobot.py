@@ -35,6 +35,10 @@ file name without "_sim_to_real.zarr" (aiet_grip_sim_to_real.zarr: "aiet_grip").
 batch shares (openpi DataConfig.source_weights) read it. A dataset made before that file existed: filled in from each
 episode's is_sim when it has a single sim source, on the next --append.
 
+--refresh-actions: the sim episodes already in the dataset get their `actions` rewritten from their zarrs' current
+commands (avatar_intelligence's sim_to_real relabel changes them in place: consensus commands) -- nothing else touched;
+with --append, after the new episodes are added.
+
 --append: add only what's new to an existing dataset instead of rebuilding it -- the episodes of each zarr past those
 already converted (meta/converted_sources.json: per source zarr, its episodes done; zarrs are append-only, so new
 episodes are the last ones). A dataset made before that file existed: inferred (the real zarr's episodes first, then
@@ -77,10 +81,14 @@ def main(
     sim_paths: list[str] | None = None,
     sim_repeat: int = 1,
     append: bool = False,
+    refresh_actions: bool = False,
     push_to_hub: bool = False,
 ):
     output_path = HF_LEROBOT_HOME / repo_name
     sources = [(data_path, 0, 1)] + [(path, 1, sim_repeat) for path in (sim_paths or [])]
+    if refresh_actions and not append:  # (only the existing sim episodes' actions: e.g. after sim_to_real's relabel)
+        _refresh_actions(output_path)
+        return
     if append and output_path.exists():
         dataset = _open_for_append(repo_name)
         done = _converted_sources(output_path, dataset.meta.total_episodes, sources)
@@ -91,6 +99,8 @@ def main(
                 totals[is_sim] += _write_zarr(dataset, path, task, is_sim, start_episode=done.get(path, 0), labels=labels)
             done[path] = _num_episodes(path)
             _save_converted(output_path, done, labels)
+        if refresh_actions:  # (the episodes converted before this append: their actions from the zarrs' current commands)
+            _refresh_actions(output_path)
         _summary(output_path, totals, appended=True)
         return
 
@@ -222,6 +232,46 @@ def _summary(output_path, totals: dict, appended: bool) -> None:
             print(f"  source {label!r}: {labels.count(label)} episodes, {frames} frames ({100 * frames / total:.1f}%)")
     print("next: recompute the norm stats (scripts/compute_norm_stats.py), then rsync the dataset and assets to Quest")
     print("====", flush=True)
+
+
+def _refresh_actions(output_path) -> None:
+    """Every sim episode's `actions` (palm commands + gripper command) rewritten from its source zarr's current commands --
+    e.g. after avatar_intelligence's sim_to_real relabel (consensus commands) changed them in place; nothing else
+    touched (the images, states and metadata stay). A source's episodes are in the dataset in its zarr's order
+    (meta/episode_sources.json: their label), each episode's rows checked against the zarr's. Then recompute the norm
+    stats and rsync (the changed parquet files)."""
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    labels = json.loads((output_path / "meta" / "episode_sources.json").read_text())
+    done = json.loads((output_path / "meta" / "converted_sources.json").read_text())
+    chunks_size = json.loads((output_path / "meta" / "info.json").read_text()).get("chunks_size", 1000)
+    for path in list(done)[1:]:  # (the real zarr is the first source: unchanged)
+        label = source_label(path, 1)
+        episodes = [i for i, l in enumerate(labels) if l == label]
+        root = zarr.open(path, mode="r")
+        ends = np.asarray(root["meta/episode_ends"])
+        palm = np.asarray(root["data/palm_pose_xyz_rpy_commands"])
+        grip = np.asarray(root["data/gripper_value_commands"])
+        changed, total = 0, 0.0
+        for k, episode in enumerate(episodes):
+            start = int(ends[k - 1]) if k > 0 else 0
+            end = int(ends[k])
+            file = output_path / "data" / f"chunk-{episode // chunks_size:03d}" / f"episode_{episode:06d}.parquet"
+            table = pq.read_table(file)
+            if table.num_rows != end - start:
+                raise SystemExit(f"{file}: {table.num_rows} rows, {path}'s episode {k} has {end - start} -- not this zarr's order")
+            actions = np.concatenate([palm[start:end], grip[start:end, None]], axis=1).astype(np.float32)
+            old = np.asarray(table.column("actions").to_pylist(), dtype=np.float32)
+            total += float(np.abs(old - actions).mean())
+            column = pa.FixedSizeListArray.from_arrays(pa.array(actions.reshape(-1), type=pa.float32()), 7)
+            table = table.set_column(table.schema.get_field_index("actions"), table.schema.field("actions"), column)
+            pq.write_table(table, file)
+            changed += 1
+        print(f"{label}: {changed} episodes' actions refreshed from {path} (mean |change| {total / max(changed, 1):.4f})")
+    print("next: recompute the norm stats (scripts/compute_norm_stats.py), then rsync the dataset and assets to Quest")
 
 
 def _open_for_append(repo_name: str):
