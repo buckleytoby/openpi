@@ -51,6 +51,8 @@ The resulting dataset is saved to $HF_LEROBOT_HOME / <repo_name> (defaults to
 point at the SSD as shown above, since the converted dataset can be large).
 """
 
+import concurrent.futures
+import os
 import shutil
 
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
@@ -82,6 +84,7 @@ def main(
     sim_repeat: int = 1,
     append: bool = False,
     refresh_actions: bool = False,
+    refresh_images: bool = False,
     push_to_hub: bool = False,
 ):
     output_path = HF_LEROBOT_HOME / repo_name
@@ -89,12 +92,18 @@ def main(
     if refresh_actions and not append:  # (only the existing sim episodes' actions: e.g. after sim_to_real's relabel)
         _refresh_actions(output_path)
         return
+    if refresh_images:  # (only the existing sim episodes' images: after avatar_intelligence's run_rerender_images.sh)
+        _refresh_images(output_path)
+        return
     if append and output_path.exists():
         dataset = _open_for_append(repo_name)
         done = _converted_sources(output_path, dataset.meta.total_episodes, sources)
         labels = _episode_sources(output_path, dataset.meta.total_episodes, done, data_path)
         totals = {0: 0, 1: 0}
         for path, is_sim, repeat in sources:
+            if not os.path.exists(path) and path in done:  # (converted before, its zarr not on this machine -- e.g. the real data's: nothing new from it)
+                print(f"{path}: not here; its {done[path]} converted episodes kept, nothing appended from it")
+                continue
             for _ in range(repeat):
                 totals[is_sim] += _write_zarr(dataset, path, task, is_sim, start_episode=done.get(path, 0), labels=labels)
             done[path] = _num_episodes(path)
@@ -274,6 +283,61 @@ def _refresh_actions(output_path) -> None:
     print("next: recompute the norm stats (scripts/compute_norm_stats.py), then rsync the dataset and assets to Quest")
 
 
+def _refresh_images(output_path) -> None:
+    """Every sim episode's camera images (wrist / env / overhead) rewritten from its source zarr's -- after
+    avatar_intelligence's run_rerender_images.sh re-rendered them there (e.g. domain randomization); only the episodes
+    the zarr records as patched (attrs "images_patched"). Each episode's rows checked against the zarr's; the states,
+    actions and metadata stay (the norm stats are the states' and actions': unchanged)."""
+    import io
+    import json
+    import os
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from PIL import Image
+
+    labels = json.loads((output_path / "meta" / "episode_sources.json").read_text())
+    done = json.loads((output_path / "meta" / "converted_sources.json").read_text())
+    chunks_size = json.loads((output_path / "meta" / "info.json").read_text()).get("chunks_size", 1000)
+
+    def png(frame: np.ndarray) -> bytes:
+        buffer = io.BytesIO()
+        Image.fromarray(np.asarray(frame, dtype=np.uint8)).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    for path in list(done)[1:]:  # (the real zarr is the first source: unchanged)
+        if not os.path.exists(path):
+            print(f"{path}: not here -- skipped")
+            continue
+        label = source_label(path, 1)
+        episodes = [i for i, l in enumerate(labels) if l == label]
+        root = zarr.open(path, mode="r")
+        patched = set(root.attrs.get("images_patched", []))
+        trees = [os.path.basename(str(t)) for t in root.attrs["sim_episodes"]]
+        ends = np.asarray(root["meta/episode_ends"])
+        changed = 0
+        for k, episode in enumerate(tqdm.tqdm(episodes, desc=f"{label}: images")):
+            if k >= len(trees) or trees[k] not in patched:
+                continue
+            start = int(ends[k - 1]) if k > 0 else 0
+            end = int(ends[k])
+            file = output_path / "data" / f"chunk-{episode // chunks_size:03d}" / f"episode_{episode:06d}.parquet"
+            table = pq.read_table(file)
+            if table.num_rows != end - start:
+                raise SystemExit(f"{file}: {table.num_rows} rows, {path}'s episode {k} has {end - start} -- not this zarr's order")
+            for key in ("wrist_image", "env_image", "overhead_image"):
+                frames = root["data"][key][start:end]
+                old = table.column(key)
+                paths = [v["path"] for v in old.to_pylist()]
+                column = pa.StructArray.from_arrays([pa.array([png(f) for f in frames], type=pa.binary()), pa.array(paths, type=pa.string())],
+                                                    fields=list(old.type))
+                table = table.set_column(table.schema.get_field_index(key), table.schema.field(key), column)
+            pq.write_table(table, file)
+            changed += 1
+        print(f"{label}: {changed} episodes' images refreshed from {path} ({len(patched)} patched there)")
+    print("next: rsync the dataset (the rewritten parquet files) to where it trains")
+
+
 def _open_for_append(repo_name: str):
     """An existing LeRobot dataset, ready for add_frame / save_episode -- LeRobotDataset.create's setup on the existing
     metadata, without loading its data (LeRobotDataset(repo) would build the whole Arrow cache first)."""
@@ -370,19 +434,31 @@ def _write_zarr(dataset, path: str, task: str, is_sim: int, start_episode: int =
     if num_steps <= 0:
         print(f"{path}: nothing new ({start_episode} episodes already converted)")
         return 0
+    def load(a: int, b: int) -> dict:  # (an episode's frames: the images' JPEG 2000 decoded -- ~25% of an episode's time)
+        return {key: data[key][a:b] for key in ("palm_pose_xyz_rpy_states", "gripper_value_states", "biotac_lh", "palm_pose_xyz_rpy_commands",
+                                                 "gripper_value_commands", "wrist_image", "env_image", "overhead_image")}
+
+    spans = []  # (episode index, start, end) of the episodes to convert
+    for episode_idx, end in enumerate(episode_ends):
+        if episode_idx >= start_episode:
+            spans.append((episode_idx, start, int(end)))
+            start = int(end)
+    # the next episode read in a background thread while this one is saved (save_episode: the PNGs, the parquet, the stats)
+    prefetch = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     with tqdm.tqdm(total=num_steps, desc=f"Converting {'sim' if is_sim else 'real'} frames", unit="frame") as pbar:
-        for episode_idx, end in enumerate(episode_ends):
-            if episode_idx < start_episode:
-                continue
-            end = int(end)
-            palm_states = data["palm_pose_xyz_rpy_states"][start:end]
-            gripper_states = data["gripper_value_states"][start:end]
-            biotac = data["biotac_lh"][start:end][:, BIOTAC_CHANNELS]
-            palm_commands = data["palm_pose_xyz_rpy_commands"][start:end]
-            gripper_commands = data["gripper_value_commands"][start:end]
-            wrist_images = data["wrist_image"][start:end]
-            env_images = data["env_image"][start:end]
-            overhead_images = data["overhead_image"][start:end]
+        nxt = prefetch.submit(load, spans[0][1], spans[0][2])
+        for k, (episode_idx, start, end) in enumerate(spans):
+            frames = nxt.result()
+            if k + 1 < len(spans):
+                nxt = prefetch.submit(load, spans[k + 1][1], spans[k + 1][2])
+            palm_states = frames["palm_pose_xyz_rpy_states"]
+            gripper_states = frames["gripper_value_states"]
+            biotac = frames["biotac_lh"][:, BIOTAC_CHANNELS]
+            palm_commands = frames["palm_pose_xyz_rpy_commands"]
+            gripper_commands = frames["gripper_value_commands"]
+            wrist_images = frames["wrist_image"]
+            env_images = frames["env_image"]
+            overhead_images = frames["overhead_image"]
 
             state = np.concatenate([palm_states, gripper_states[:, None], biotac], axis=-1).astype(np.float32)
             actions = np.concatenate([palm_commands, gripper_commands[:, None]], axis=-1).astype(np.float32)
@@ -413,7 +489,7 @@ def _write_zarr(dataset, path: str, task: str, is_sim: int, start_episode: int =
             # concatenate_datasets): ~38 GB of RAM by 230k frames (the real + sim dataset got OOM-killed). Each
             # episode is already on disk as its parquet, and nothing here reads it back: start it empty again.
             dataset.hf_dataset = dataset.create_hf_dataset()
-            start = end
+    prefetch.shutdown()
     return num_steps
 
 
