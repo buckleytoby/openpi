@@ -100,6 +100,11 @@ class DataConfig:
     # LeRobot datasets: episodes shorter than this many frames are never sampled for training (most of their action chunk
     # would be padding, the last action repeated), nor counted in the norm stats. 0: every episode.
     min_episode_length: int = 0
+    # With source_weights: per source label, start-cost bin edges -- that source's share split equally over its non-empty
+    # bins (each frame's start-state task cost: meta/frame_start_cost.npy, examples/dexnex/write_start_costs.py; costs
+    # outside the edges count in the first / last bin). As the diffusion BC's cost balancing (avatar_master
+    # docs/tree_exploration/bc_variety_test.md, round 9). A source left out keeps uniform weights.
+    cost_bins: dict[str, Sequence[float]] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -1132,6 +1137,40 @@ def _rotated_dexnex(name: str) -> TrainConfig:
 
 
 _CONFIGS += [_rotated_dexnex("pi05_dexnex_erlenmeyer_cotrain"), _rotated_dexnex("pi05_dexnex_erlenmeyer_cotrain_balanced")]
+
+
+def _cost_balanced_dexnex(name: str) -> TrainConfig:
+    """``name`` with its sim sources' shares balanced over start-cost bins (DataConfig.cost_bins), as ``<name>_costbal``.
+    aiet_grip_lift: the BC variety test's bins (start ~11.7, lift ~9.5). aiet_grip (the full task: carrying and placing go
+    on below 9.5, 54% of its frames at 7.5-9.5): those bins plus place / early carry / late carry below 9.5."""
+    base = next(config for config in _CONFIGS if config.name == name)
+    cost_bins = {
+        "aiet_grip": (0.0, 7.5, 8.5, 9.5, 10.0, 10.5, 11.0, 11.5, 100.0),
+        "aiet_grip_lift": (0.0, 9.5, 10.0, 10.5, 11.0, 11.5, 100.0),
+    }
+    data = dataclasses.replace(base.data, base_config=dataclasses.replace(base.data.base_config, cost_bins=cost_bins))
+    return dataclasses.replace(base, name=f"{name}_costbal", data=data)
+
+
+_CONFIGS += [_cost_balanced_dexnex("pi05_dexnex_erlenmeyer_cotrain_balanced_rot")]
+
+
+def _sim_only_dexnex() -> TrainConfig:
+    """pi05_dexnex_erlenmeyer_cotrain_balanced_rot_costbal on its sim sources only (real share 0): whether the sim data
+    alone changes the policy's behavior. Half aiet_grip, half aiet_grip_lift, each cost-balanced; from pi05_base (JAX;
+    PyTorch: --pytorch-weight-path). Its norm stats from the sim frames only (compute_norm_stats.py skips 0-share sources)."""
+    base = next(config for config in _CONFIGS if config.name == "pi05_dexnex_erlenmeyer_cotrain_balanced_rot_costbal")
+    shares = {"real": 0.0, "aiet_grip": 0.5, "aiet_grip_lift": 0.5}
+    data = dataclasses.replace(base.data, base_config=dataclasses.replace(base.data.base_config, source_weights=shares))
+    return dataclasses.replace(
+        base,
+        name="pi05_dexnex_erlenmeyer_simonly_rot_costbal",
+        data=data,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    )
+
+
+_CONFIGS += [_sim_only_dexnex()]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

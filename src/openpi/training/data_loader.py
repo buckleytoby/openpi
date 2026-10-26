@@ -184,11 +184,41 @@ def source_weighted_sampler(
         share = shares.get(label, 0.0) / total
         logging.info(f"source {label!r}: {n} frames ({100 * n / num_samples:.1f}% of the dataset) -> {100 * share:.1f}% "
                      f"of each batch" + (f" (each frame ~{share * num_samples / n:.2f}x as often as uniform)" if share else " (not sampled)"))
+    if data_config.cost_bins:
+        weights = _cost_balanced(weights, data_config, meta.root, lengths, labels)
     generator = torch.Generator()
     generator.manual_seed(seed)
     return torch.utils.data.WeightedRandomSampler(
         torch.as_tensor(weights, dtype=torch.double), num_samples=num_samples, replacement=True, generator=generator
     )
+
+
+def _cost_balanced(weights: np.ndarray, data_config: _config.DataConfig, root, lengths: list, labels: list) -> np.ndarray:
+    """source_weighted_sampler's weights with each DataConfig.cost_bins source's share split equally over its cost bins
+    (each frame's start-state cost: meta/frame_start_cost.npy, examples/dexnex/write_start_costs.py): a frame's weight is
+    its source's share / the number of non-empty bins / its bin's frame count. Sources without bins keep theirs."""
+    record = root / "meta" / "frame_start_cost.npy"
+    if not record.exists():
+        raise FileNotFoundError(f"{record}: no per-frame start costs (cost_bins needs them) -- examples/dexnex/write_start_costs.py")
+    cost = np.load(record)
+    if len(cost) != len(weights):
+        raise ValueError(f"{record}: {len(cost)} costs for {len(weights)} frames")
+    frame_label = np.concatenate([np.full(n, l if l is not None else "", dtype=object) for n, l in zip(lengths, labels)])
+    weights = weights.copy()
+    for label, edges in data_config.cost_bins.items():
+        rows = np.where((frame_label == label) & (weights > 0))[0]
+        if not len(rows):
+            raise ValueError(f"cost_bins: no sampled frames of {label!r}")
+        if not np.isfinite(cost[rows]).all():
+            raise ValueError(f"cost_bins: {label!r} has frames without a start cost")
+        share = weights[rows].sum()
+        b = np.clip(np.digitize(cost[rows], edges) - 1, 0, len(edges) - 2)
+        counts = np.bincount(b, minlength=len(edges) - 1)
+        used = np.count_nonzero(counts)
+        weights[rows] = share / used / counts[b]
+        logging.info(f"source {label!r} balanced over start-cost bins {list(edges)}: frames per bin {counts.tolist()} -> each "
+                     f"non-empty bin {100 * share / used:.1f}% of each batch")
+    return weights
 
 
 def min_length_sampler(data_config: _config.DataConfig, num_samples: int, *, shuffle: bool, seed: int = 0):

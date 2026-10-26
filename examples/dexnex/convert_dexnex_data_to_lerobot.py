@@ -85,6 +85,7 @@ def main(
     append: bool = False,
     refresh_actions: bool = False,
     refresh_images: bool = False,
+    workers: int = 0,
     push_to_hub: bool = False,
 ):
     output_path = HF_LEROBOT_HOME / repo_name
@@ -93,7 +94,7 @@ def main(
         _refresh_actions(output_path)
         return
     if refresh_images:  # (only the existing sim episodes' images: after avatar_intelligence's run_rerender_images.sh)
-        _refresh_images(output_path)
+        _refresh_images(output_path, workers)  # (workers: processes, 0 = one per CPU)
         return
     if append and output_path.exists():
         dataset = _open_for_append(repo_name)
@@ -283,27 +284,53 @@ def _refresh_actions(output_path) -> None:
     print("next: recompute the norm stats (scripts/compute_norm_stats.py), then rsync the dataset and assets to Quest")
 
 
-def _refresh_images(output_path) -> None:
-    """Every sim episode's camera images (wrist / env / overhead) rewritten from its source zarr's -- after
-    avatar_intelligence's run_rerender_images.sh re-rendered them there (e.g. domain randomization); only the episodes
-    the zarr records as patched (attrs "images_patched"). Each episode's rows checked against the zarr's; the states,
-    actions and metadata stay (the norm stats are the states' and actions': unchanged)."""
+def _refresh_episode(job) -> str:
+    """(a _refresh_images worker) One episode's parquet with its camera images replaced by its source zarr's frames
+    [start, end), written to a temporary file then moved over the old one (an interrupted refresh never leaves a
+    half-written episode). Returns an error message, or ""."""
     import io
-    import json
-    import os
 
     import pyarrow as pa
     import pyarrow.parquet as pq
     from PIL import Image
 
-    labels = json.loads((output_path / "meta" / "episode_sources.json").read_text())
-    done = json.loads((output_path / "meta" / "converted_sources.json").read_text())
-    chunks_size = json.loads((output_path / "meta" / "info.json").read_text()).get("chunks_size", 1000)
+    file, path, k, start, end = job
+    table = pq.read_table(file)
+    if table.num_rows != end - start:
+        return f"{file}: {table.num_rows} rows, {path}'s episode {k} has {end - start} -- not this zarr's order"
+    data = zarr.open(path, mode="r")["data"]
 
     def png(frame: np.ndarray) -> bytes:
         buffer = io.BytesIO()
         Image.fromarray(np.asarray(frame, dtype=np.uint8)).save(buffer, format="PNG")
         return buffer.getvalue()
+
+    for key in ("wrist_image", "env_image", "overhead_image"):
+        frames = data[key][start:end]
+        old = table.column(key)
+        paths = [v["path"] for v in old.to_pylist()]
+        column = pa.StructArray.from_arrays([pa.array([png(f) for f in frames], type=pa.binary()), pa.array(paths, type=pa.string())],
+                                            fields=list(old.type))
+        table = table.set_column(table.schema.get_field_index(key), table.schema.field(key), column)
+    tmp = file.with_name(file.name + ".tmp")
+    pq.write_table(table, tmp)
+    os.replace(tmp, file)
+    return ""
+
+
+def _refresh_images(output_path, workers: int = 0) -> None:
+    """Every sim episode's camera images (wrist / env / overhead) rewritten from its source zarr's -- after
+    avatar_intelligence's run_rerender_images.sh re-rendered them there (e.g. domain randomization); only the episodes
+    the zarr records as patched (attrs "images_patched"). Each episode's rows checked against the zarr's; the states,
+    actions and metadata stay (the norm stats are the states' and actions': unchanged). ``workers`` processes (one
+    episode each at a time; 0: one per CPU)."""
+    import json
+    import multiprocessing
+
+    labels = json.loads((output_path / "meta" / "episode_sources.json").read_text())
+    done = json.loads((output_path / "meta" / "converted_sources.json").read_text())
+    chunks_size = json.loads((output_path / "meta" / "info.json").read_text()).get("chunks_size", 1000)
+    workers = workers or os.cpu_count() or 1
 
     for path in list(done)[1:]:  # (the real zarr is the first source: unchanged)
         if not os.path.exists(path):
@@ -315,26 +342,17 @@ def _refresh_images(output_path) -> None:
         patched = set(root.attrs.get("images_patched", []))
         trees = [os.path.basename(str(t)) for t in root.attrs["sim_episodes"]]
         ends = np.asarray(root["meta/episode_ends"])
-        changed = 0
-        for k, episode in enumerate(tqdm.tqdm(episodes, desc=f"{label}: images")):
+        jobs = []
+        for k, episode in enumerate(episodes):
             if k >= len(trees) or trees[k] not in patched:
                 continue
-            start = int(ends[k - 1]) if k > 0 else 0
-            end = int(ends[k])
             file = output_path / "data" / f"chunk-{episode // chunks_size:03d}" / f"episode_{episode:06d}.parquet"
-            table = pq.read_table(file)
-            if table.num_rows != end - start:
-                raise SystemExit(f"{file}: {table.num_rows} rows, {path}'s episode {k} has {end - start} -- not this zarr's order")
-            for key in ("wrist_image", "env_image", "overhead_image"):
-                frames = root["data"][key][start:end]
-                old = table.column(key)
-                paths = [v["path"] for v in old.to_pylist()]
-                column = pa.StructArray.from_arrays([pa.array([png(f) for f in frames], type=pa.binary()), pa.array(paths, type=pa.string())],
-                                                    fields=list(old.type))
-                table = table.set_column(table.schema.get_field_index(key), table.schema.field(key), column)
-            pq.write_table(table, file)
-            changed += 1
-        print(f"{label}: {changed} episodes' images refreshed from {path} ({len(patched)} patched there)")
+            jobs.append((file, path, k, int(ends[k - 1]) if k > 0 else 0, int(ends[k])))
+        with multiprocessing.get_context("fork").Pool(workers) as pool:
+            errors = [m for m in tqdm.tqdm(pool.imap_unordered(_refresh_episode, jobs), total=len(jobs), desc=f"{label}: images ({workers} workers)") if m]
+        if errors:
+            raise SystemExit("\n".join(errors[:10]))
+        print(f"{label}: {len(jobs)} episodes' images refreshed from {path} ({len(patched)} patched there)")
     print("next: rsync the dataset (the rewritten parquet files) to where it trains")
 
 

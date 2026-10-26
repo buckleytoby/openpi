@@ -110,7 +110,17 @@ def fast_lerobot_stats(data_config: _config.DataConfig, action_horizon: int, max
     stats = {key: normalize.RunningStats() for key in ("state", "actions")}
     pending = {key: [] for key in stats}
     frames = 0
+    skip = set()  # (episodes of the sources source_weights gives no share: never sampled for training)
+    if data_config.source_weights:
+        import json
+
+        labels = json.loads((meta.root / "meta" / "episode_sources.json").read_text())
+        skip = {i for i, label in enumerate(labels) if not data_config.source_weights.get(label, 0.0)}
+        if skip:
+            print(f"{len(skip)} episodes of 0-share sources left out")
     for path in tqdm.tqdm(files, desc="Computing stats (parquet)"):
+        if int(os.path.basename(path)[len("episode_"):-len(".parquet")]) in skip:
+            continue
         table = pq.read_table(path, columns=columns).to_pydict()
         n = len(table[columns[0]])
         if n < data_config.min_episode_length:  # (never sampled for training)

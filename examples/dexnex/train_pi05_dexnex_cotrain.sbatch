@@ -50,11 +50,14 @@ cd "$OPENPI_REPO_DIR" || exit 1
 # LeRobot's load_dataset("parquet") first writes an Arrow copy of the whole dataset (~34 GB) into the HF datasets
 # cache -- by default ~/.cache/huggingface/datasets, i.e. the Quest home directory, whose quota it overflows
 # ("OSError: [Errno 122] Disk quota exceeded", job 4350183). Keep that cache on scratch instead.
+# DATASET_DIR: another copy of the combined dataset bound in its place (same repo_id inside the container), e.g. the one
+# with domain-randomized sim images:
+#   DATASET_DIR=/projects/$SBATCH_ACCOUNT/dexnex/task_24_erlenmeyer_flask_cotrain_dr CONFIG=pi05_dexnex_erlenmeyer_simonly_rot_costbal ...
 mkdir -p /scratch/$USER/hf_datasets_cache
 
 singularity exec --nv --overlay /projects/$SBATCH_ACCOUNT/dexnex/overlay.img \
   --bind $PWD:/app \
-  --bind /projects/$SBATCH_ACCOUNT/dexnex/task_24_erlenmeyer_flask_cotrain:/data/my_dataset/dexnex/task_24_erlenmeyer_flask_cotrain \
+  --bind ${DATASET_DIR:-/projects/$SBATCH_ACCOUNT/dexnex/task_24_erlenmeyer_flask_cotrain}:/data/my_dataset/dexnex/task_24_erlenmeyer_flask_cotrain \
   --bind /scratch/$USER/openpi_cache:/openpi_assets \
   --bind /scratch/$USER/hf_datasets_cache:/hf_datasets_cache \
   --env HF_LEROBOT_HOME=/data/my_dataset \
