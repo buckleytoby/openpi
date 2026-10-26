@@ -79,6 +79,15 @@ class Args:
     # e.g. "checkpoints/pi05_dexnex_erlenmeyer/run1_h100_12h"
     checkpoint_root: str | None = None
 
+    # (dexnex) If set, hot-reload across MODEL FAMILIES instead: a JSON file listing them --
+    #   {"default": "<key>/<step>", "models": [{"key", "root", "config", "description"}, ...]}
+    # -- "root" a folder of training-step checkpoints (each with params/: JAX, or model.safetensors: PyTorch), "config" the training config to build the
+    # model / transforms with. The selections are "<key>/<step>", each loaded with ITS family's config and its own
+    # checkpoint's norm stats (its assets/ -- the families' data differ, so one fixed set can't serve them all). The
+    # client gets the descriptions with the list (the inference node's GUI shows them). Replaces --checkpoint-root and
+    # --policy (the "default" selection is served at startup).
+    model_registry: str | None = None
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -146,12 +155,17 @@ class _ReloadHandler:
         train_config: _config.TrainConfig,
         checkpoint_root: pathlib.Path,
         default_prompt: str | None,
+        registry: dict | None = None,
     ):
         self._server = server
         self._train_config = train_config
         self._checkpoint_root = checkpoint_root
         self._default_prompt = default_prompt
         self._current = BASE_CHECKPOINT_SELECTION
+        self._registry = registry  # (--model-registry: families of checkpoints, each with its own config)
+        if registry is not None:
+            self._norm_stats = None
+            return
 
         data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
         self._norm_stats = data_config.norm_stats
@@ -162,6 +176,19 @@ class _ReloadHandler:
                 train_config.name,
             )
 
+    def _registry_selections(self) -> dict[str, tuple[dict, pathlib.Path]]:
+        """--model-registry: every "<key>/<step>" -> (its family entry, its checkpoint folder)."""
+        out = {}
+        for entry in self._registry["models"]:
+            root = pathlib.Path(entry["root"])
+            if not root.exists():
+                continue
+            steps = sorted((p for p in root.iterdir() if p.is_dir() and ((p / "params").exists() or (p / "model.safetensors").exists())),
+                           key=lambda p: int(p.name) if p.name.isdigit() else p.name)
+            for step in steps:
+                out[f"{entry['key']}/{step.name}"] = (entry, step)
+        return out
+
     def _list_checkpoint_dirs(self) -> list[str]:
         if not self._checkpoint_root.exists():
             return []
@@ -171,6 +198,10 @@ class _ReloadHandler:
         )
 
     def _build_policy(self, selection: str) -> _policy.Policy:
+        if self._registry is not None:  # (the family's own config; norm stats from the checkpoint's own assets/)
+            entry, checkpoint_dir = self._registry_selections()[selection]
+            return _policy_config.create_trained_policy(_config.get_config(entry["config"]), checkpoint_dir,
+                                                        default_prompt=self._default_prompt)
         if selection == BASE_CHECKPOINT_SELECTION:
             checkpoint_dir = BASE_CHECKPOINT_DIR
         else:
@@ -186,13 +217,20 @@ class _ReloadHandler:
         cmd = command.get("cmd")
         try:
             if cmd == "list_checkpoints":
+                if self._registry is not None:
+                    selections = self._registry_selections()
+                    descriptions = {sel: f"{entry['description']}  [config {entry['config']}; {path}]"
+                                    for sel, (entry, path) in selections.items()}
+                    return {"success": True, "checkpoints": list(selections), "descriptions": descriptions, "current": self._current}
                 checkpoints = [BASE_CHECKPOINT_SELECTION, *self._list_checkpoint_dirs()]
                 return {"success": True, "checkpoints": checkpoints, "current": self._current}
             if cmd == "current_checkpoint":
                 return {"success": True, "current": self._current}
             if cmd == "load_checkpoint":
                 selection = command.get("selection")
-                if selection != BASE_CHECKPOINT_SELECTION and selection not in self._list_checkpoint_dirs():
+                known = (self._registry_selections() if self._registry is not None
+                         else [BASE_CHECKPOINT_SELECTION, *self._list_checkpoint_dirs()])
+                if selection not in known:
                     return {"success": False, "message": f"Unknown checkpoint selection: {selection!r}"}
                 # Drop the OLD policy's GPU-resident weights BEFORE building
                 # the new one -- otherwise _build_policy loads the new
@@ -220,7 +258,19 @@ class _ReloadHandler:
 def main(args: Args) -> None:
     reload_handler: _ReloadHandler | None = None
 
-    if args.checkpoint_root is not None:
+    if args.model_registry is not None:  # (families of checkpoints, each with its own config: the GUI picks)
+        import json
+
+        registry = json.loads(pathlib.Path(args.model_registry).read_text())
+        reload_handler = _ReloadHandler(None, None, pathlib.Path("."), args.default_prompt, registry=registry)
+        selections = reload_handler._registry_selections()
+        if not selections:
+            raise ValueError(f"--model-registry {args.model_registry}: no checkpoints found under its roots")
+        initial_selection = registry.get("default") if registry.get("default") in selections else list(selections)[-1]
+        logging.info("Model registry %s: %d checkpoints; serving %s", args.model_registry, len(selections), initial_selection)
+        policy = reload_handler._build_policy(initial_selection)
+        reload_handler._current = initial_selection
+    elif args.checkpoint_root is not None:
         if not isinstance(args.policy, Checkpoint):
             raise ValueError("--checkpoint-root requires --policy.config/--policy.dir (a Checkpoint), not Default.")
         # Build the reload handler FIRST and load the initial policy through
@@ -277,8 +327,9 @@ def main(args: Args) -> None:
         reload_handler._server = server
         server.set_on_control(reload_handler)
         logging.info(
-            "Hot-reload enabled (checkpoint_root=%s, initial=%s)",
-            args.checkpoint_root, reload_handler._current,
+            "Hot-reload enabled (%s, initial=%s)",
+            f"model_registry={args.model_registry}" if args.model_registry else f"checkpoint_root={args.checkpoint_root}",
+            reload_handler._current,
         )
 
     server.serve_forever()
