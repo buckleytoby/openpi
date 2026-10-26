@@ -170,13 +170,16 @@ def source_weighted_sampler(
         raise ValueError(f"{record}: {len(labels)} labels for {len(lengths)} episodes")
     if sum(lengths) != num_samples:
         raise ValueError(f"the episodes' lengths add up to {sum(lengths)} frames, the dataset has {num_samples}")
+    labels = [l if n >= data_config.min_episode_length else None for n, l in zip(lengths, labels)]  # (too short: weight 0)
+    if None in labels:
+        logging.info(f"min_episode_length {data_config.min_episode_length}: {labels.count(None)} episodes never sampled")
     shares = dict(data_config.source_weights)
-    frames = {label: sum(n for n, l in zip(lengths, labels) if l == label) for label in dict.fromkeys(labels)}
+    frames = {label: sum(n for n, l in zip(lengths, labels) if l == label) for label in dict.fromkeys(labels) if label is not None}
     missing = [label for label, share in shares.items() if share > 0 and not frames.get(label)]
     if missing:
         raise ValueError(f"source_weights {shares}: no frames of {missing} in the dataset (its sources: {frames})")
     total = sum(shares.get(label, 0.0) for label in frames)
-    weights = np.concatenate([np.full(n, shares.get(l, 0.0) / total / frames[l]) for n, l in zip(lengths, labels)])
+    weights = np.concatenate([np.full(n, shares.get(l, 0.0) / total / frames[l] if l is not None else 0.0) for n, l in zip(lengths, labels)])
     for label, n in frames.items():
         share = shares.get(label, 0.0) / total
         logging.info(f"source {label!r}: {n} frames ({100 * n / num_samples:.1f}% of the dataset) -> {100 * share:.1f}% "
@@ -186,6 +189,24 @@ def source_weighted_sampler(
     return torch.utils.data.WeightedRandomSampler(
         torch.as_tensor(weights, dtype=torch.double), num_samples=num_samples, replacement=True, generator=generator
     )
+
+
+def min_length_sampler(data_config: _config.DataConfig, num_samples: int, *, shuffle: bool, seed: int = 0):
+    """Every frame except those of episodes shorter than DataConfig.min_episode_length: shuffled without replacement,
+    else in order. Index i: the LeRobot dataset's frame i (episodes in order, as it loads them)."""
+    meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+    lengths = [meta.episodes[i]["length"] for i in range(meta.total_episodes)]
+    if sum(lengths) != num_samples:
+        raise ValueError(f"the episodes' lengths add up to {sum(lengths)} frames, the dataset has {num_samples}")
+    starts = np.cumsum([0, *lengths[:-1]])
+    kept = [range(s, s + n) for s, n in zip(starts, lengths) if n >= data_config.min_episode_length]
+    logging.info(f"min_episode_length {data_config.min_episode_length}: {len(lengths) - len(kept)} episodes never sampled")
+    kept = [int(i) for r in kept for i in r]
+    if not shuffle:
+        return kept
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.SubsetRandomSampler(kept, generator=generator)
 
 
 def create_rlds_dataset(
@@ -361,6 +382,10 @@ def create_torch_data_loader(
         if sampler is not None:
             raise NotImplementedError("source_weights with PyTorch DDP (its DistributedSampler) isn't supported")
         sampler = source_weighted_sampler(data_config, len(dataset), seed)  # (shuffled: it draws at random)
+    elif data_config.min_episode_length > 0 and data_config.repo_id != "fake":
+        if sampler is not None:
+            raise NotImplementedError("min_episode_length with PyTorch DDP (its DistributedSampler) isn't supported")
+        sampler = min_length_sampler(data_config, len(dataset), shuffle=shuffle, seed=seed)
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(

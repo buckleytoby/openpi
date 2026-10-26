@@ -29,6 +29,7 @@ import logging
 import os
 import platform
 import shutil
+import threading
 import time
 
 import jax
@@ -146,8 +147,59 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
-    """Save a checkpoint with model state, optimizer state, and metadata."""
+class CpuEma:
+    """An EMA of the trainable weights, in fp32 in system RAM (the JAX trainer's ema_params; too big for the GPU next to
+    full fine-tuning). Every ``every`` steps the weights are copied to pinned memory and folded in with
+    ``decay ** every`` on a background thread, so the GPU doesn't wait for it."""
+
+    def __init__(self, model, decay: float, every: int, init_path=None):
+        params = dict(model.named_parameters())
+        self.names = [name for name, param in params.items() if param.requires_grad]
+        init = safetensors.torch.load_file(init_path) if init_path is not None else None  # (a checkpoint's EMA)
+        self.ema = {
+            name: (init[name] if init is not None else params[name].detach()).to("cpu", torch.float32)
+            for name in self.names
+        }
+        del init
+        self.staging = {name: torch.empty_like(params[name], device="cpu").pin_memory() for name in self.names}
+        self.decay = decay**every
+        self.every = every
+        self.thread = None
+
+    def update(self, model, global_step: int):
+        if global_step % self.every:
+            return
+        self.wait()
+        params = dict(model.named_parameters())
+        for name in self.names:
+            self.staging[name].copy_(params[name].detach(), non_blocking=True)
+        torch.cuda.synchronize()
+        self.thread = threading.Thread(target=self._fold, daemon=True)
+        self.thread.start()
+
+    def _fold(self):
+        for name in self.names:
+            self.ema[name].lerp_(self.staging[name].float(), 1 - self.decay)
+
+    def wait(self):
+        if self.thread is not None:
+            self.thread.join()
+            self.thread = None
+
+    def state_dict(self, model, keys):
+        """The model's state dict (on the CPU) with the trainable weights replaced by the EMA, in the model's dtype --
+        only ``keys`` (save_model's: one name per shared tensor, e.g. lm_head tied to embed_tokens)."""
+        self.wait()
+        state = model.state_dict()
+        return {
+            name: (self.ema[name].to(state[name].dtype) if name in self.ema else state[name].detach().cpu()).contiguous()
+            for name in keys
+        }
+
+
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, ema=None):
+    """Save a checkpoint with model state, optimizer state, and metadata. With ``ema``, model.safetensors holds the EMA
+    weights and model_raw.safetensors the raw ones."""
     if not is_main:
         return
 
@@ -164,7 +216,13 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
         # Save model state using safetensors (handle shared tensors)
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        if ema is not None:
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model_raw.safetensors")
+            with safetensors.safe_open(tmp_ckpt_dir / "model_raw.safetensors", "pt") as raw:
+                keys = list(raw.keys())
+            safetensors.torch.save_file(ema.state_dict(model_to_save, keys), tmp_ckpt_dir / "model.safetensors")
+        else:
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -217,7 +275,9 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
-        safetensors_path = ckpt_dir / "model.safetensors"
+        safetensors_path = ckpt_dir / "model_raw.safetensors"  # (an EMA run's raw weights: its model.safetensors is the EMA)
+        if not safetensors_path.exists():
+            safetensors_path = ckpt_dir / "model.safetensors"
 
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
@@ -416,6 +476,18 @@ def train_loop(config: _config.TrainConfig):
         enable_gradient_checkpointing = False
         logging.info("Gradient checkpointing is not supported for this model")
 
+    # Freeze the token embeddings (before DDP: it registers only the parameters that require gradients)
+    if config.pytorch_freeze_embeddings:
+        frozen = [
+            name
+            for name, param in model.named_parameters()
+            if name.endswith(("language_model.embed_tokens.weight", "gemma_expert.lm_head.weight"))
+            and not param.requires_grad_(False).requires_grad
+        ]
+        logging.info(f"Froze {frozen}")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logging.info(f"Trainable parameters: {trainable / 1e9:.3f}B of {sum(p.numel() for p in model.parameters()) / 1e9:.3f}B")
+
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
@@ -455,19 +527,43 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
-    optim = torch.optim.AdamW(
-        model.parameters(),
+    if config.pytorch_optimizer == "adamw8bit":
+        import bitsandbytes as bnb
+
+        optim_class = bnb.optim.AdamW8bit
+    else:
+        optim_class = torch.optim.AdamW
+    optim = optim_class(
+        [p for p in model.parameters() if p.requires_grad],
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
     )
+    logging.info(f"Optimizer: {optim_class.__module__}.{optim_class.__name__}")
 
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
         global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
         logging.info(f"Resumed training from step {global_step}")
+
+    ema = None
+    if config.pytorch_ema_every > 0 and is_main:
+        if config.ema_decay is None:
+            raise ValueError("pytorch_ema_every > 0 needs the config's ema_decay")
+        ema_init = None  # (resuming an EMA run: its last checkpoint's model.safetensors)
+        if resuming and (config.checkpoint_dir / f"{global_step}" / "model_raw.safetensors").exists():
+            ema_init = config.checkpoint_dir / f"{global_step}" / "model.safetensors"
+        ema = CpuEma(
+            model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model,
+            config.ema_decay,
+            config.pytorch_ema_every,
+            init_path=ema_init,
+        )
+        logging.info(
+            f"EMA: decay {config.ema_decay} in system RAM, every {config.pytorch_ema_every} steps (from {ema_init or 'the initial weights'})"
+        )
 
     def lr_schedule(step: int):
         if step < warmup_steps:
@@ -496,7 +592,8 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
-        logging.info("EMA is not supported for PyTorch training")
+        if ema is None:
+            logging.info("EMA: off (pytorch_ema_every 0)")
         logging.info(f"Training precision: {model_cfg.dtype}")
 
     # Training loop - iterate until we reach num_train_steps
@@ -601,8 +698,10 @@ def train_loop(config: _config.TrainConfig):
                 infos = []  # Reset stats collection
 
             global_step += 1
+            if ema is not None:
+                ema.update(model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model, global_step)
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, ema=ema)
 
             # Update progress bar
             if pbar is not None:

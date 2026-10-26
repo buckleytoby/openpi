@@ -113,6 +113,8 @@ def fast_lerobot_stats(data_config: _config.DataConfig, action_horizon: int, max
     for path in tqdm.tqdm(files, desc="Computing stats (parquet)"):
         table = pq.read_table(path, columns=columns).to_pydict()
         n = len(table[columns[0]])
+        if n < data_config.min_episode_length:  # (never sampled for training)
+            continue
         cols = {k: np.asarray(v) for k, v in table.items()}
         chunk = np.minimum(np.arange(n)[:, None] + np.arange(action_horizon)[None], n - 1)  # (clamped at the episode's end)
         for i in range(n):

@@ -9,6 +9,7 @@ import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
+import numpy as np
 import flax.nnx as nnx
 from typing_extensions import override
 import tyro
@@ -96,6 +97,9 @@ class DataConfig:
     # frames drawn with replacement, each weighted by its source's share / that source's frame count (the shares hold
     # whatever each source's size). A source left out isn't sampled. None: uniform over the frames.
     source_weights: dict[str, float] | None = None
+    # LeRobot datasets: episodes shorter than this many frames are never sampled for training (most of their action chunk
+    # would be padding, the last action repeated), nor counted in the norm stats. 0: every episode.
+    min_episode_length: int = 0
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -371,6 +375,9 @@ class LeRobotDexnexDataConfig(DataConfigFactory):
     # The state values the model sees (DexnexInputs.state_dim): 10 with the BioTac tactile, 7 without
     # (sim/real co-training: the sim has no tactile).
     state_dim: int = 10
+    # Added to the palm roll and yaw, model side only (DexnexInputs.angle_offset): -pi/2 moves their +-pi seam out of the
+    # data. Changes what the model sees: a checkpoint is only served by a config with the angle_offset it trained with.
+    angle_offset: float = 0.0
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -393,8 +400,12 @@ class LeRobotDexnexDataConfig(DataConfigFactory):
         )
 
         data_transforms = _transforms.Group(
-            inputs=[dexnex_policy.DexnexInputs(model_type=model_config.model_type, state_dim=self.state_dim)],
-            outputs=[dexnex_policy.DexnexOutputs()],
+            inputs=[
+                dexnex_policy.DexnexInputs(
+                    model_type=model_config.model_type, state_dim=self.state_dim, angle_offset=self.angle_offset
+                )
+            ],
+            outputs=[dexnex_policy.DexnexOutputs(angle_offset=self.angle_offset)],
         )
 
         # The dexnex actions (palm pose + gripper commands) are absolute, not delta, so we
@@ -539,6 +550,17 @@ class TrainConfig:
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
+    # PyTorch only: freeze PaliGemma's 257k-token embedding table (and the action expert's lm_head, which the loss never
+    # uses) -- ~3 GB less gradient + optimizer state for pi0.5 (the prompt is fixed; the loss is on the actions).
+    pytorch_freeze_embeddings: bool = False
+    # PyTorch only: "adamw8bit" keeps AdamW's moments in 8 bits (bitsandbytes) -- ~11 GB less for pi0.5. Together with
+    # pytorch_freeze_embeddings, full fine-tuning fits a 32 GB GPU.
+    pytorch_optimizer: Literal["adamw", "adamw8bit"] = "adamw"
+    # PyTorch only: > 0 keeps an ema_decay EMA of the trainable weights, in fp32 in system RAM (too big for a 32 GB GPU
+    # next to full fine-tuning), updated every this many steps with ema_decay ** this. As the JAX trainer's EMA, a
+    # checkpoint's model.safetensors is then the EMA weights (what serve_policy loads); model_raw.safetensors the raw
+    # ones (for --resume). 0: no EMA.
+    pytorch_ema_every: int = 0
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
@@ -847,6 +869,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 source_weights={"real": 0.5, "aiet_grip": 0.25, "aiet_grip_lift": 0.25},
+                min_episode_length=10,  # (the action horizon: 18 sim episodes are shorter)
             ),
             state_dim=7,
         ),
@@ -876,7 +899,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotDexnexDataConfig(
             repo_id="dexnex/task_24_erlenmeyer_flask_cotrain",
-            base_config=DataConfig(prompt_from_task=True),
+            base_config=DataConfig(prompt_from_task=True, min_episode_length=10),  # (the action horizon: 18 sim episodes are shorter)
             state_dim=7,
         ),
         batch_size=128,
@@ -1099,6 +1122,16 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
+
+def _rotated_dexnex(name: str) -> TrainConfig:
+    """``name`` with the palm roll and yaw rotated by -90 deg model side (LeRobotDexnexDataConfig.angle_offset), as
+    ``<name>_rot``: the dexnex data's +-pi seam moved out of the data. Its own norm stats (compute_norm_stats.py)."""
+    base = next(config for config in _CONFIGS if config.name == name)
+    return dataclasses.replace(base, name=f"{name}_rot", data=dataclasses.replace(base.data, angle_offset=-np.pi / 2))
+
+
+_CONFIGS += [_rotated_dexnex("pi05_dexnex_erlenmeyer_cotrain"), _rotated_dexnex("pi05_dexnex_erlenmeyer_cotrain_balanced")]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
