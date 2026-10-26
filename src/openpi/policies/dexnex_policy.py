@@ -28,6 +28,17 @@ def _parse_image(image) -> np.ndarray:
     return image
 
 
+# The palm roll and yaw: state / action indices (xyz, roll, pitch, yaw, gripper, ...)
+ROLL_YAW = [3, 5]
+
+
+def _rotate_roll_yaw(x, offset: float) -> np.ndarray:
+    """``x`` (..., >= 6: palm xyz + rpy first) with ``offset`` added to its roll and yaw, wrapped to [-pi, pi)."""
+    x = np.array(x, dtype=np.float32 if np.asarray(x).dtype != np.float64 else np.float64)
+    x[..., ROLL_YAW] = (x[..., ROLL_YAW] + offset + np.pi) % (2 * np.pi) - np.pi
+    return x
+
+
 @dataclasses.dataclass(frozen=True)
 class DexnexInputs(transforms.DataTransformFn):
     """
@@ -50,6 +61,10 @@ class DexnexInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
     # 10: palm pose + gripper + biotac; 7: palm pose + gripper (no tactile)
     state_dim: int = 10
+    # Added to the palm roll and yaw (state and actions, wrapped to [-pi, pi); DexnexOutputs takes it back off): moves
+    # their +-pi seam out of the data. -pi/2 for the dexnex data, whose palm yaw spans 60 -> 180 -> -135 deg (none in
+    # -120..30) and roll ~110 deg: both continuous after it. 0: as recorded.
+    angle_offset: float = 0.0
 
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/env_image"])
@@ -62,8 +77,12 @@ class DexnexInputs(transforms.DataTransformFn):
         # "observation/env_image_valid" key), env_image is always real, so default to True.
         env_image_valid = bool(data.get("observation/env_image_valid", True))
 
+        state = np.asarray(data["observation/state"])
+        if self.angle_offset:
+            state = _rotate_roll_yaw(state, self.angle_offset)
+
         inputs = {
-            "state": np.asarray(data["observation/state"])[..., : self.state_dim],
+            "state": state[..., : self.state_dim],
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": left_wrist_image,
@@ -79,7 +98,7 @@ class DexnexInputs(transforms.DataTransformFn):
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.
         if "actions" in data:
-            inputs["actions"] = data["actions"]
+            inputs["actions"] = _rotate_roll_yaw(data["actions"], self.angle_offset) if self.angle_offset else data["actions"]
 
         # Pass the prompt (aka language instruction) to the model.
         if "prompt" in data:
@@ -92,7 +111,13 @@ class DexnexInputs(transforms.DataTransformFn):
 class DexnexOutputs(transforms.DataTransformFn):
     """Converts outputs from the model back to the dataset-specific format. Used for inference only."""
 
+    # DexnexInputs.angle_offset: taken back off the predicted roll and yaw (the robot's convention again)
+    angle_offset: float = 0.0
+
     def __call__(self, data: dict) -> dict:
         # Actions were padded to the model action dimension; only the first 7 (palm pose +
         # gripper) are real -- the rest is padding.
-        return {"actions": np.asarray(data["actions"][..., :7])}
+        actions = np.asarray(data["actions"][..., :7])
+        if self.angle_offset:
+            actions = _rotate_roll_yaw(actions, -self.angle_offset)
+        return {"actions": actions}

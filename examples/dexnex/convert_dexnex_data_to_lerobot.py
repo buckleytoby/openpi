@@ -51,6 +51,8 @@ The resulting dataset is saved to $HF_LEROBOT_HOME / <repo_name> (defaults to
 point at the SSD as shown above, since the converted dataset can be large).
 """
 
+import concurrent.futures
+import os
 import shutil
 
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
@@ -95,6 +97,9 @@ def main(
         labels = _episode_sources(output_path, dataset.meta.total_episodes, done, data_path)
         totals = {0: 0, 1: 0}
         for path, is_sim, repeat in sources:
+            if not os.path.exists(path) and path in done:  # (converted before, its zarr not on this machine -- e.g. the real data's: nothing new from it)
+                print(f"{path}: not here; its {done[path]} converted episodes kept, nothing appended from it")
+                continue
             for _ in range(repeat):
                 totals[is_sim] += _write_zarr(dataset, path, task, is_sim, start_episode=done.get(path, 0), labels=labels)
             done[path] = _num_episodes(path)
@@ -370,19 +375,31 @@ def _write_zarr(dataset, path: str, task: str, is_sim: int, start_episode: int =
     if num_steps <= 0:
         print(f"{path}: nothing new ({start_episode} episodes already converted)")
         return 0
+    def load(a: int, b: int) -> dict:  # (an episode's frames: the images' JPEG 2000 decoded -- ~25% of an episode's time)
+        return {key: data[key][a:b] for key in ("palm_pose_xyz_rpy_states", "gripper_value_states", "biotac_lh", "palm_pose_xyz_rpy_commands",
+                                                 "gripper_value_commands", "wrist_image", "env_image", "overhead_image")}
+
+    spans = []  # (episode index, start, end) of the episodes to convert
+    for episode_idx, end in enumerate(episode_ends):
+        if episode_idx >= start_episode:
+            spans.append((episode_idx, start, int(end)))
+            start = int(end)
+    # the next episode read in a background thread while this one is saved (save_episode: the PNGs, the parquet, the stats)
+    prefetch = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     with tqdm.tqdm(total=num_steps, desc=f"Converting {'sim' if is_sim else 'real'} frames", unit="frame") as pbar:
-        for episode_idx, end in enumerate(episode_ends):
-            if episode_idx < start_episode:
-                continue
-            end = int(end)
-            palm_states = data["palm_pose_xyz_rpy_states"][start:end]
-            gripper_states = data["gripper_value_states"][start:end]
-            biotac = data["biotac_lh"][start:end][:, BIOTAC_CHANNELS]
-            palm_commands = data["palm_pose_xyz_rpy_commands"][start:end]
-            gripper_commands = data["gripper_value_commands"][start:end]
-            wrist_images = data["wrist_image"][start:end]
-            env_images = data["env_image"][start:end]
-            overhead_images = data["overhead_image"][start:end]
+        nxt = prefetch.submit(load, spans[0][1], spans[0][2])
+        for k, (episode_idx, start, end) in enumerate(spans):
+            frames = nxt.result()
+            if k + 1 < len(spans):
+                nxt = prefetch.submit(load, spans[k + 1][1], spans[k + 1][2])
+            palm_states = frames["palm_pose_xyz_rpy_states"]
+            gripper_states = frames["gripper_value_states"]
+            biotac = frames["biotac_lh"][:, BIOTAC_CHANNELS]
+            palm_commands = frames["palm_pose_xyz_rpy_commands"]
+            gripper_commands = frames["gripper_value_commands"]
+            wrist_images = frames["wrist_image"]
+            env_images = frames["env_image"]
+            overhead_images = frames["overhead_image"]
 
             state = np.concatenate([palm_states, gripper_states[:, None], biotac], axis=-1).astype(np.float32)
             actions = np.concatenate([palm_commands, gripper_commands[:, None]], axis=-1).astype(np.float32)
@@ -413,7 +430,7 @@ def _write_zarr(dataset, path: str, task: str, is_sim: int, start_episode: int =
             # concatenate_datasets): ~38 GB of RAM by 230k frames (the real + sim dataset got OOM-killed). Each
             # episode is already on disk as its parquet, and nothing here reads it back: start it empty again.
             dataset.hf_dataset = dataset.create_hf_dataset()
-            start = end
+    prefetch.shutdown()
     return num_steps
 
 
