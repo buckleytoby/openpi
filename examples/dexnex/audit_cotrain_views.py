@@ -99,7 +99,7 @@ def main(
     check(all("/layout/" in p for p in sim_paths), f"the sim zarrs are the layout ones: {list(sim_paths)}")
     for path, n in converted.items():
         label = "real" if "sim_to_real" not in path else os.path.basename(path.rstrip("/")).removesuffix(".zarr").removesuffix("_sim_to_real")
-        z_eps = len(zarr.open(path, mode="r")["meta/episode_ends"]) if os.path.exists(path) else None
+        z_eps = int(zarr.open(path, mode="r")["meta/episode_ends"].shape[0]) if os.path.exists(path) else None
         check(per.get(label) == n and (z_eps is None or z_eps == n),
               f"{label}: {per.get(label)} dataset episodes, {n} converted, {z_eps if z_eps is not None else '(zarr not here)'} in {path}")
 
