@@ -105,6 +105,10 @@ class DataConfig:
     # outside the edges count in the first / last bin). As the diffusion BC's cost balancing (avatar_master
     # docs/tree_exploration/bc_variety_test.md, round 9). A source left out keeps uniform weights.
     cost_bins: dict[str, Sequence[float]] | None = None
+    # With source_weights: per view (meta/frame_views.npz, examples/dexnex/write_frame_views.py: a bool per frame -- e.g.
+    # the sim's flush / corner / wall starts, its fine alignment), that share of every batch drawn uniformly from the view's
+    # frames; the rest (1 - the views' shares) keeps the source / cost-bin weights. Views overlap: a frame in two gets both.
+    view_weights: dict[str, float] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -1171,6 +1175,32 @@ def _sim_only_dexnex() -> TrainConfig:
 
 
 _CONFIGS += [_sim_only_dexnex()]
+
+
+def _view_weighted_dexnex(name: str, views: dict[str, float]) -> TrainConfig:
+    """``name`` with the hard cases sampled more (DataConfig.view_weights; sim frames only, the real data untagged), as
+    ``<name>_views``: the real policy was still bad at a pellet pressed against the tray (flush / corner / wall starts) and
+    at the fine alignment (a pad within 2 cm of the pellet, before the lift) -- avatar_intelligence tree_exploration/
+    sim_views.py tags them. The same frames as ``name``: its norm stats (assets) are used as they are."""
+    base = next(config for config in _CONFIGS if config.name == name)
+    data = dataclasses.replace(base.data, base_config=dataclasses.replace(base.data.base_config, view_weights=views),
+                               assets=dataclasses.replace(base.data.assets, assets_dir=str(base.assets_dirs)))
+    return dataclasses.replace(base, name=f"{name}_views", data=data)
+
+
+_CONFIGS += [_view_weighted_dexnex("pi05_dexnex_erlenmeyer_cotrain_balanced_rot_costbal", {"flush_corner": 0.15, "fine_align": 0.20})]
+
+
+def _layout_dexnex(name: str, repo_id: str) -> TrainConfig:
+    """``name`` on the co-train dataset rebuilt with the sim episodes re-rendered under randomized layouts (the table and the
+    tray moved relative to the robot: avatar_intelligence sim_to_real.py --layout-scale, export_layout_batches.sh), as
+    ``<name>_layout``. Its own norm stats (the palm poses spread wider): compute_norm_stats.py --config-name <it>."""
+    base = next(config for config in _CONFIGS if config.name == name)
+    data = dataclasses.replace(base.data, repo_id=repo_id, assets=dataclasses.replace(base.data.assets, assets_dir=None))
+    return dataclasses.replace(base, name=f"{name}_layout", data=data)
+
+
+_CONFIGS += [_layout_dexnex("pi05_dexnex_erlenmeyer_cotrain_balanced_rot_costbal_views", "dexnex/task_24_erlenmeyer_flask_cotrain_layout")]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

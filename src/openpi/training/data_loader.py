@@ -186,6 +186,8 @@ def source_weighted_sampler(
                      f"of each batch" + (f" (each frame ~{share * num_samples / n:.2f}x as often as uniform)" if share else " (not sampled)"))
     if data_config.cost_bins:
         weights = _cost_balanced(weights, data_config, meta.root, lengths, labels)
+    if data_config.view_weights:
+        weights = _view_weighted(weights, data_config, meta.root)
     generator = torch.Generator()
     generator.manual_seed(seed)
     return torch.utils.data.WeightedRandomSampler(
@@ -219,6 +221,35 @@ def _cost_balanced(weights: np.ndarray, data_config: _config.DataConfig, root, l
         logging.info(f"source {label!r} balanced over start-cost bins {list(edges)}: frames per bin {counts.tolist()} -> each "
                      f"non-empty bin {100 * share / used:.1f}% of each batch")
     return weights
+
+
+def _view_weighted(weights: np.ndarray, data_config: _config.DataConfig, root) -> np.ndarray:
+    """The weights (normalized) mixed with each DataConfig.view_weights view: that share of every batch drawn uniformly
+    from the view's frames (meta/frame_views.npz, examples/dexnex/write_frame_views.py) among those the sampler can draw
+    (weight > 0); the rest keeps the weights as they were."""
+    record = root / "meta" / "frame_views.npz"
+    if not record.exists():
+        raise FileNotFoundError(f"{record}: no per-frame views (view_weights needs them) -- examples/dexnex/write_frame_views.py")
+    views = np.load(record)
+    base = weights / weights.sum()
+    shares = dict(data_config.view_weights)
+    if sum(shares.values()) >= 1.0:
+        raise ValueError(f"view_weights {shares}: the views' shares must leave some batch for the rest")
+    out = (1.0 - sum(shares.values())) * base
+    for view, share in shares.items():
+        if view not in views.files:
+            raise ValueError(f"view_weights: no view {view!r} in {record} (it has {views.files})")
+        tags = np.asarray(views[view], dtype=bool)
+        if len(tags) != len(weights):
+            raise ValueError(f"{record}: {view!r} has {len(tags)} frames, the dataset {len(weights)}")
+        tags &= base > 0
+        if not tags.any():
+            raise ValueError(f"view_weights: {view!r} has no sampled frames")
+        out += share * tags / tags.sum()
+        logging.info(f"view {view!r}: {int(tags.sum())} frames ({100 * tags.mean():.1f}% of the dataset; "
+                     f"{100 * base[tags].sum():.1f}% of each batch before) -> +{100 * share:.0f}% of each batch drawn from them "
+                     f"({100 * out[tags].sum():.1f}% in all)")
+    return out
 
 
 def min_length_sampler(data_config: _config.DataConfig, num_samples: int, *, shuffle: bool, seed: int = 0):
