@@ -1,5 +1,5 @@
 """Each frame's views -> <dataset>/meta/frame_views.npz (one bool array per view, one entry per frame in the dataset's order;
-false for the real data's frames -- only sim frames are tagged): what DataConfig.view_weights samples more.
+false for the real data's frames -- only sim frames are tagged -- except --real-views): what DataConfig.view_weights samples more.
 
 The views come per sim zarr, in its frame order (avatar_intelligence tree_exploration/sim_views.py: <zarr name>_views.npz
 beside the zarrs -- flush_corner, fine_align). Each source's episodes are the k-th episode of that label <-> the zarr's
@@ -23,12 +23,25 @@ from examples.dexnex.convert_dexnex_data_to_lerobot import source_label
 VIEWS = ("flush_corner", "fine_align")
 
 
-def main(repo_name: str, views: list[str]) -> None:
+def main(repo_name: str, views: list[str], real_views: list[str] = []) -> None:
+    """``real_views``: NAME=K items -- a view of every frame of the real episodes from the K-th real episode on (0-based,
+    in dataset order: e.g. K = the real episode count before an --append of new real bags)."""
     output_path = HF_LEROBOT_HOME / repo_name
     labels = json.loads((output_path / "meta" / "episode_sources.json").read_text())
     lengths = [json.loads(line)["length"] for line in (output_path / "meta" / "episodes.jsonl").read_text().splitlines() if line.strip()]
     starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
     frame_views = {view: np.zeros(int(sum(lengths)), bool) for view in VIEWS}
+    real = [i for i, l in enumerate(labels) if l == "real"]
+    for item in real_views:
+        name, first = item.split("=")
+        if name in VIEWS:
+            raise SystemExit(f"--real-views {name}: a sim view's name")
+        tags = frame_views[name] = np.zeros(int(sum(lengths)), bool)
+        for i in real[int(first):]:
+            tags[starts[i]:starts[i] + lengths[i]] = True
+        print(f"real view {name}: real episodes {first}..{len(real) - 1} ({len(real[int(first):])} episodes, {int(tags.sum())} frames)")
+        if not tags.any():
+            raise SystemExit(f"--real-views {item}: no real episodes from {first} on ({len(real)} real episodes)")
     for item in views:
         zarr_path, views_path = (os.path.expanduser(p) for p in item.split("="))
         label = source_label(zarr_path, 1)

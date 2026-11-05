@@ -1202,6 +1202,21 @@ def _layout_dexnex(name: str, repo_id: str) -> TrainConfig:
 
 _CONFIGS += [_layout_dexnex("pi05_dexnex_erlenmeyer_cotrain_balanced_rot_costbal_views", "dexnex/task_24_erlenmeyer_flask_cotrain_layout")]
 
+
+def _aux_view_dexnex(name: str, repo_id: str, view: str, share: float) -> TrainConfig:
+    """``name`` on a copy of its dataset with new real episodes appended, those episodes' frames a view of their own
+    (write_frame_views.py --real-views ``view``=<first new real episode>) sampled with ``share`` more of each batch, as
+    ``<name>_aux``: the extra flush / corner real demos (aiet_real_world/flush_corner_aux_*). Its own norm stats."""
+    base = next(config for config in _CONFIGS if config.name == name)
+    views = {**base.data.base_config.view_weights, view: share}
+    data = dataclasses.replace(base.data, repo_id=repo_id, base_config=dataclasses.replace(base.data.base_config, view_weights=views),
+                               assets=dataclasses.replace(base.data.assets, assets_dir=None))
+    return dataclasses.replace(base, name=f"{name}_aux", data=data)
+
+
+_CONFIGS += [_aux_view_dexnex("pi05_dexnex_erlenmeyer_cotrain_balanced_rot_costbal_views_layout",
+                              "dexnex/task_24_erlenmeyer_flask_cotrain_layout_aux", "flush_corner_aux", 0.10)]
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
