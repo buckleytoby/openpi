@@ -1217,6 +1217,27 @@ def _aux_view_dexnex(name: str, repo_id: str, view: str, share: float) -> TrainC
 _CONFIGS += [_aux_view_dexnex("pi05_dexnex_erlenmeyer_cotrain_balanced_rot_costbal_views_layout",
                               "dexnex/task_24_erlenmeyer_flask_cotrain_layout_aux", "flush_corner_aux", 0.10)]
 
+
+def _real_only_dexnex(name: str) -> TrainConfig:
+    """``name`` on its real sources only (sim shares 0), as pi05_dexnex_erlenmeyer_realonly_rot_aux: the same dataset,
+    model, schedule and real views as the co-train run, so the two compare directly (what the sim data adds). The sim-only
+    parts dropped: the sim views (flush_corner, fine_align) and the sim cost bins. From pi05_base (PyTorch:
+    --pytorch-weight-path). Its norm stats from the real frames only (compute_norm_stats.py skips 0-share sources)."""
+    base = next(config for config in _CONFIGS if config.name == name)
+    shares = {label: (1.0 if label == "real" else 0.0) for label in base.data.base_config.source_weights}
+    views = {view: share for view, share in base.data.base_config.view_weights.items() if view not in ("flush_corner", "fine_align")}
+    data = dataclasses.replace(base.data, base_config=dataclasses.replace(
+        base.data.base_config, source_weights=shares, cost_bins=None, view_weights=views))
+    return dataclasses.replace(
+        base,
+        name="pi05_dexnex_erlenmeyer_realonly_rot_aux",
+        data=data,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    )
+
+
+_CONFIGS += [_real_only_dexnex("pi05_dexnex_erlenmeyer_cotrain_balanced_rot_costbal_views_layout_aux")]
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
