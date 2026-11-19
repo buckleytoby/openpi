@@ -265,9 +265,10 @@ class OfflineSource:
         logging.info("LoRA RL offline decisions: frames of %s (%d, %s)", self.repo_id, self.n,
                      "its training weights" if self.p is not None else "uniform")
 
-    def draw(self, k: int) -> list[tuple[int, dict]]:
+    def draw(self, k: int, indices=None) -> list[tuple[int, dict]]:
+        """k frames drawn with the training weights -- or these dataset indices."""
         out = []
-        for i in self.rng.choice(self.n, size=k, p=self.p):
+        for i in (self.rng.choice(self.n, size=k, p=self.p) if indices is None else indices):
             raw = _np_tree(self.repack(self.dataset[int(i)]))
             raw.pop("actions", None)
             out.append((int(i), raw))
@@ -284,7 +285,8 @@ class LoRATrainer:
         self.model = policy._model
         self.device = policy._pytorch_device
         self.cfg = config
-        self.dir = pathlib.Path(rl_dir).expanduser() / (session or time.strftime("%Y%m%d_%H%M%S"))
+        self.session = session or time.strftime("%Y%m%d_%H%M%S")
+        self.dir = pathlib.Path(rl_dir).expanduser() / self.session
         self.dir.mkdir(parents=True, exist_ok=True)
         self.modules = add_lora(self.model, config.rank, config.alpha, config.targets, config.action_proj, config.backbone)
         self.params = [p for m in self.modules.values() for p in (m.lora_A, m.lora_B)]
@@ -404,14 +406,15 @@ class LoRATrainer:
             raise KeyError(f"rl_id {rl_id}: no such record (expired, or recorded before a restart)")
         return rec
 
-    def offline_draw(self, k: int, num_samples: int, noise_temperature, purpose: str) -> dict:
-        """k training-set frames, num_samples candidates sampled at each by the current policy (recorded as offline
-        decisions, purpose "seed" or "step"): per frame its rl_id, the candidates in action units [N, H, d], the state
-        and the wrist image (what the critic needs)."""
+    def offline_draw(self, k: int, num_samples: int, noise_temperature, purpose: str, indices=None) -> dict:
+        """k training-set frames (or these dataset indices), num_samples candidates sampled at each by the current policy
+        (recorded as offline decisions, purpose "seed" or "step"; "eval": not recorded -- e.g. a fixed set re-scored after
+        every update): per frame its rl_id, the candidates in action units [N, H, d], the state and the wrist image (what
+        the critic needs)."""
         if self.offline is None:
             self.offline = OfflineSource(self.policy)
         frames = []
-        for i, raw in self.offline.draw(int(k)):
+        for i, raw in self.offline.draw(int(k), None if indices is None else [int(j) for j in indices]):
             obs = dict(raw)
             obs["__num_samples"] = int(num_samples)
             obs["__noise_temperature"] = np.asarray(noise_temperature, np.float32)
@@ -420,8 +423,11 @@ class LoRATrainer:
             rl_id = out.get("__rl_id")
             if rl_id is None:
                 raise RuntimeError("offline draw: the batch wasn't recorded")
-            rec = self.records[rl_id]
-            rec.offline, rec.meta = purpose, {"frame": i}
+            if purpose == "eval":
+                self.records.pop(rl_id, None)
+            else:
+                rec = self.records[rl_id]
+                rec.offline, rec.meta = purpose, {"frame": i}
             wrist = next((raw[k_] for k_ in ("observation/wrist_image", "wrist_image") if k_ in raw), None)
             state = next((raw[k_] for k_ in ("observation/state", "state") if k_ in raw), None)
             frames.append({"rl_id": int(rl_id), "frame": i, "actions": np.asarray(out["actions"], np.float32),
@@ -675,7 +681,8 @@ class RLControl:
                 return {"success": True, "rl_id": rl_id}
             if cmd == "rl_offline_draw":
                 return t.offline_draw(int(command.get("k", 1)), int(command["num_samples"]),
-                                      command.get("noise_temperature", 1.0), str(command.get("purpose", "step")))
+                                      command.get("noise_temperature", 1.0), str(command.get("purpose", "step")),
+                                      command.get("indices"))
             if cmd == "rl_update":
                 return t.update(offline_only=bool(command.get("offline_only", False)))
             if cmd == "rl_status":
@@ -702,12 +709,14 @@ class RLControl:
         cfg = RLConfig.from_dict(command.get("config", {}))
         t = self.trainer
         fresh = False
-        if t is not None and t.policy is policy and t.cfg.structure() == cfg.structure():
+        session = command.get("session", "")
+        same_session = t is not None and (not session or session == t.session)  # (another session: its own LoRA, from zero)
+        if t is not None and t.policy is policy and t.cfg.structure() == cfg.structure() and same_session:
             t.reconfigure(cfg)
         else:
             if t is not None and t.policy is policy:
                 t.detach()
-            self.trainer = t = LoRATrainer(policy, cfg, self.rl_dir, command.get("session", ""))
+            self.trainer = t = LoRATrainer(policy, cfg, self.rl_dir, session)
             fresh = True
         resume = command.get("resume") or ""
         if resume and t.version == 0:
