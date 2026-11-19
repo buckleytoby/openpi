@@ -47,21 +47,26 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
-            except ConnectionRefusedError:
+            except (OSError, EOFError, websockets.exceptions.WebSocketException):  # (dexnex: refused, or reset / closed
+                # mid-handshake -- e.g. the server restarting to switch models; it listens again once the model is loaded)
                 logging.info("Still waiting for server...")
-                time.sleep(5)
+                time.sleep(2)
 
-    @override
-    def infer(self, obs: Dict) -> Dict:  # noqa: UP006
-        data = self._packer.pack(obs)
+    def _roundtrip(self, data: bytes):
+        """Send ``data``, return the reply; a closed connection (e.g. the server restarted to switch models): reconnect
+        and retry once."""
         try:
             self._ws.send(data)
-            response = self._ws.recv()
+            return self._ws.recv()
         except websockets.exceptions.ConnectionClosed:  # (dexnex: reconnect and retry once instead of failing forever)
             logging.warning("openpi server connection closed: reconnecting")
             self._ws, self._server_metadata = self._wait_for_server()
             self._ws.send(data)
-            response = self._ws.recv()
+            return self._ws.recv()
+
+    @override
+    def infer(self, obs: Dict) -> Dict:  # noqa: UP006
+        response = self._roundtrip(self._packer.pack(obs))
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
@@ -76,9 +81,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         str, ...}). Raises RuntimeError if the server has no control handler
         configured, or on any other server-side error (same convention as
         infer())."""
-        data = self._packer.pack({_CONTROL_KEY: command})
-        self._ws.send(data)
-        response = self._ws.recv()
+        response = self._roundtrip(self._packer.pack({_CONTROL_KEY: command}))
         if isinstance(response, str):
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)

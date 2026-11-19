@@ -109,6 +109,8 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
+        self.sample_actions_eager = self.sample_actions  # (dexnex: kept -- policy.py picks compiled or eager per call)
+        self.compile_mode = config.pytorch_compile_mode
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
 
@@ -374,11 +376,16 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+    def sample_actions(self, device, observation, noise=None, num_steps=10, num_samples: int = 1) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)
+
+        (dexnex) num_samples > 1: that many action chunks per observation -- its prefix (images + prompt) encoded ONCE, its
+        KV cache tiled, the samples denoised as one batch (as the JAX Pi0.sample_actions). Returns [b * num_samples, ah,
+        ad], each observation's samples consecutive. (Before: the policy repeated the observation num_samples times, and
+        the vision encoder + language model ran on every copy -- 64 samples took ~6.8 s.)"""
         bsize = observation.state.shape[0]
         if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            actions_shape = (bsize * num_samples, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
@@ -398,6 +405,14 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        if num_samples > 1:  # (the prefix shared by the samples: its cache, mask and state tiled)
+            if hasattr(past_key_values, "batch_repeat_interleave"):
+                past_key_values.batch_repeat_interleave(num_samples)
+            else:
+                past_key_values = [tuple(t.repeat_interleave(num_samples, 0) for t in layer) for layer in past_key_values]
+            prefix_pad_masks = prefix_pad_masks.repeat_interleave(num_samples, 0)
+            state = state.repeat_interleave(num_samples, 0)
+            bsize = bsize * num_samples
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)

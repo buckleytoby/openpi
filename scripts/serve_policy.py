@@ -1,8 +1,11 @@
+import asyncio
 import dataclasses
 import enum
 import logging
+import os
 import pathlib
 import socket
+import sys
 
 import tyro
 
@@ -87,6 +90,11 @@ class Args:
     # client gets the descriptions with the list (the inference node's GUI shows them). Replaces --checkpoint-root and
     # --policy (the "default" selection is served at startup).
     model_registry: str | None = None
+
+    # (dexnex) If set, LoRA reinforcement learning on the served PyTorch policy (openpi/policies/lora_rl.py): the
+    # "rl_*" control commands (the rlhf_residual node's lora_rl mode drives them). Adapters, records and metrics are
+    # saved under this folder on THIS machine, e.g. ~/rlhf_lora.
+    rl_dir: str | None = None
 
 
 # Default checkpoints that should be used for each environment.
@@ -197,11 +205,14 @@ class _ReloadHandler:
             key=lambda name: int(name) if name.isdigit() else name,
         )
 
-    def _build_policy(self, selection: str) -> _policy.Policy:
+    def _build_policy(self, selection: str, compile: bool = False) -> _policy.Policy:
         if self._registry is not None:  # (the family's own config; norm stats from the checkpoint's own assets/)
             entry, checkpoint_dir = self._registry_selections()[selection]
-            return _policy_config.create_trained_policy(_config.get_config(entry["config"]), checkpoint_dir,
-                                                        default_prompt=self._default_prompt)
+            train_config = _config.get_config(entry["config"])
+            if hasattr(train_config.model, "pytorch_compile_mode"):  # (PyTorch: off -- quick tests -- or SERVE_COMPILE_MODE; JAX unaffected)
+                mode = _policy.SERVE_COMPILE_MODE if compile else None
+                train_config = dataclasses.replace(train_config, model=dataclasses.replace(train_config.model, pytorch_compile_mode=mode))
+            return _policy_config.create_trained_policy(train_config, checkpoint_dir, default_prompt=self._default_prompt)
         if selection == BASE_CHECKPOINT_SELECTION:
             checkpoint_dir = BASE_CHECKPOINT_DIR
         else:
@@ -232,6 +243,13 @@ class _ReloadHandler:
                          else [BASE_CHECKPOINT_SELECTION, *self._list_checkpoint_dirs()])
                 if selection not in known:
                     return {"success": False, "message": f"Unknown checkpoint selection: {selection!r}"}
+                compile_ = bool(command.get("compile", False))
+                if self._registry is not None:  # (a fresh process: see _restart_with)
+                    logging.info("load_checkpoint %s (PyTorch torch.compile: %s): restarting the server with it", selection,
+                                 "on" if compile_ else "off")
+                    asyncio.get_running_loop().call_later(0.2, _restart_with, selection, compile_)  # (after this reply is sent)
+                    return {"success": True, "message": f"Restarting the server with {selection}", "current": selection,
+                            "restarting": True}
                 # Drop the OLD policy's GPU-resident weights BEFORE building
                 # the new one -- otherwise _build_policy loads the new
                 # weights onto the GPU while the old policy (still
@@ -243,9 +261,9 @@ class _ReloadHandler:
                 # `del`) since jax.Array objects can be kept alive by
                 # reference cycles the refcounting alone won't break.
                 self._server.set_policy(None)
-                import gc
-                gc.collect()
-                policy = self._build_policy(selection)
+                _release_gpu_memory()
+                logging.info("load_checkpoint %s (PyTorch torch.compile: %s; request %s)", selection, "on" if compile_ else "off", command)
+                policy = self._build_policy(selection, compile=compile_)
                 self._server.set_policy(policy, metadata=policy.metadata)
                 self._current = selection
                 return {"success": True, "message": f"Loaded {selection}", "current": self._current}
@@ -253,6 +271,49 @@ class _ReloadHandler:
         except Exception as e:  # noqa: BLE001 -- report any load/build failure back to the client, don't crash the server
             logging.exception("Control command failed")
             return {"success": False, "message": f"{type(e).__name__}: {e}"}
+
+
+RESTART_SELECTION_ENV = "OPENPI_SERVE_SELECTION"  # (a restart's model, over the registry's "default")
+RESTART_COMPILE_ENV = "OPENPI_SERVE_COMPILE"
+
+
+def _restart_with(selection: str, compile_: bool) -> None:
+    """--model-registry switches: this process replaced by a fresh one (same pid, arguments and port) serving
+    ``selection``. In place, the old model's memory wasn't all given back: JAX keeps its freed GPU pool for the process's
+    life, so a PyTorch model loaded after a JAX one ran beside ~10 GB of it (21 GB vs 11 GB started on its own) and its
+    batched candidates ran out of memory. Clients reconnect (WebsocketClientPolicy: infer / send_control retry once the
+    server is back, i.e. once the model is loaded)."""
+    os.environ[RESTART_SELECTION_ENV] = selection
+    os.environ[RESTART_COMPILE_ENV] = "1" if compile_ else "0"
+    logging.info("Restarting: %s %s", sys.executable, " ".join(sys.argv))
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+def _release_gpu_memory() -> None:
+    """The old policy's GPU memory given back before the next one loads: only one model on the GPU at a time. A PyTorch
+    model is held by torch.compile's caches and, once freed, kept in torch's caching allocator -- both cleared here (a
+    JAX model's arrays go with gc; JAX keeps its freed pool for its own reuse, so a PyTorch model loaded after a JAX one
+    shares the GPU with that pool)."""
+    import gc
+    import sys
+
+    gc.collect()
+    if "torch" in sys.modules:
+        import torch
+
+        torch._dynamo.reset()  # (the compiled sample_actions, which holds the model)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            free, total = torch.cuda.mem_get_info()
+            logging.info("GPU after releasing the old policy: %.1f of %.1f GiB free", free / 2**30, total / 2**30)
+    import jax
+
+    jax.clear_caches()
 
 
 def main(args: Args) -> None:
@@ -267,8 +328,13 @@ def main(args: Args) -> None:
         if not selections:
             raise ValueError(f"--model-registry {args.model_registry}: no checkpoints found under its roots")
         initial_selection = registry.get("default") if registry.get("default") in selections else list(selections)[-1]
-        logging.info("Model registry %s: %d checkpoints; serving %s", args.model_registry, len(selections), initial_selection)
-        policy = reload_handler._build_policy(initial_selection)
+        restart = os.environ.get(RESTART_SELECTION_ENV)  # (a GUI switch: _restart_with)
+        if restart in selections:
+            initial_selection = restart
+        compile_ = os.environ.get(RESTART_COMPILE_ENV) == "1"
+        logging.info("Model registry %s: %d checkpoints; serving %s%s", args.model_registry, len(selections), initial_selection,
+                     " (switched to)" if restart in selections else "")
+        policy = reload_handler._build_policy(initial_selection, compile=compile_)
         reload_handler._current = initial_selection
     elif args.checkpoint_root is not None:
         if not isinstance(args.policy, Checkpoint):
@@ -322,10 +388,28 @@ def main(args: Args) -> None:
         port=args.port,
         metadata=policy_metadata,
     )
+    # (the server holds the policy from here: this frame's reference kept would pin the startup model on the GPU for
+    # the server's whole life -- under every model hot-reloaded after it)
+    del policy
 
+    rl_control = None
+    if args.rl_dir is not None:
+        from openpi.policies import lora_rl as _lora_rl
+
+        rl_control = _lora_rl.RLControl(lambda: server._policy, args.rl_dir)  # noqa: SLF001
+        logging.info("LoRA RL control commands on (rl_*): saving under %s", args.rl_dir)
+
+    def on_control(command: dict) -> dict:
+        if rl_control is not None and str(command.get("cmd", "")).startswith("rl_"):
+            return rl_control(command)
+        if reload_handler is not None:
+            return reload_handler(command)
+        return {"success": False, "message": f"no handler for {command.get('cmd')!r}"}
+
+    if reload_handler is not None or rl_control is not None:
+        server.set_on_control(on_control)
     if reload_handler is not None:
         reload_handler._server = server
-        server.set_on_control(reload_handler)
         logging.info(
             "Hot-reload enabled (%s, initial=%s)",
             f"model_registry={args.model_registry}" if args.model_registry else f"checkpoint_root={args.checkpoint_root}",

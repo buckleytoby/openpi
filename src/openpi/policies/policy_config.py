@@ -72,7 +72,7 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    policy = _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
@@ -92,3 +92,5 @@ def create_trained_policy(
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
+    policy.train_config = train_config  # (dexnex: LoRA RL's offline frames come from its training set -- lora_rl.py)
+    return policy
