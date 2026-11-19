@@ -15,9 +15,13 @@ critic (2 P(up) - 1). Two kinds:
               training weights): rl_offline_draw samples N candidates at each with the current policy and returns what
               the critic needs (the candidates in action units, the frame's state and wrist image); the node scores them
               and sends rl_score back. They keep the policy's behavior on the training distribution in the updates.
+              rlhf_frames_share of them come instead from past RLHF decisions' observations (rlhf_frames_dir: every
+              earlier robot session's decision frames + state, extracted on the robot PC -- real robot states), re-sampled
+              and re-scored the same way.
 
-Replay buffer (buffer_size decisions): starts with offline_seed offline decisions; each finished live decision replaces
-one (the oldest live ones go once no offline one is left). An update (rl_update) is steps_per_update optimizer steps
+Replay buffer (buffer_size decisions): starts with offline_seed offline decisions -- and, when a LoRA is loaded (resume,
+buffer_from_past), the newest past live decisions saved under rl_dir (their observations, candidates and critic rewards
+then) --; each finished live decision replaces an offline one (the oldest live ones go once no offline one is left). An update (rl_update) is steps_per_update optimizer steps
 (at least enough for every new live decision to be in one) of minibatch_records decisions each: at least
 offline_fraction of them fresh offline decisions (drawn for this update: rl_offline_draw purpose "step"), then the new
 live decisions, then random buffer entries (replays). Per decision:
@@ -149,7 +153,7 @@ class RLConfig:
     backbone: bool = False  # also the language backbone (Gemma 2B: images + prompt) -- its pass then keeps gradients: slower
     # optimization
     algorithm: str = "fpo"  # fpo | awr
-    lr: float = 5e-5
+    lr: float = 3e-4
     weight_decay: float = 0.0
     steps_per_update: int = 8  # optimizer steps per update (at least enough for every new live decision to be in one)
     minibatch_records: int = 8  # decisions per optimizer step
@@ -159,26 +163,37 @@ class RLConfig:
     ratio_scale: float = 1.0
     log_ratio_clamp: float = 5.0
     target_kl: float = 0.05
-    kl_coef: float = 0.1  # the KL-to-base penalty's weight
+    kl_coef: float = 0.5  # the KL-to-base penalty's weight
     max_grad_norm: float = 1.0
     awr_beta: float = 0.5
     awr_max_weight: float = 20.0
     # advantages
     adv_std_norm: bool = True
-    adv_std_floor: float = 0.1
+    adv_std_floor: float = 0.03
     min_records: int = 4  # new live decisions needed for an update
     # replay buffer and offline decisions
     buffer_size: int = 256
-    offline_seed: int = 128  # offline decisions the buffer starts with (the node draws and scores them at startup); 0 = none
+    offline_seed: int = 0  # offline decisions the buffer starts with (the node draws and scores them at startup); 0 = none
     offline_fraction: float = 0.25  # at least this share of every optimizer step: fresh offline decisions
+    # offline frames only from these sources (meta/episode_sources.json labels: real, aiet_grip, aiet_grip_lift, ...), with
+    # the training weights among them -- the critic knows real wrist frames only; empty = every source, as trained
+    offline_sources: tuple = ("real",)
+    # past RLHF decisions' observations (avatar_intelligence rlhf_frames.py extract, copied here): this share of the offline
+    # draws comes from them -- real robot states, re-sampled by the current policy and re-scored by the current critic
+    rlhf_frames_dir: str = "~/rlhf_frames"
+    rlhf_frames_share: float = 0.5
+    # a LoRA loaded (resume): the replay buffer filled with the newest past live decisions (their saved records under
+    # rl_dir: observation, candidates, critic rewards), up to buffer_size
+    buffer_from_past: bool = True
     # bookkeeping
     max_pending: int = 256  # recorded batches waiting for their scores (the oldest dropped past this)
     save_records: bool = True
+    save_every: int = 16  # lora_vNNN.pt (~110 MB with the optimizer state) every this many updates (and at rl_save)
 
     @classmethod
     def from_dict(cls, d: dict) -> "RLConfig":
         names = {f.name for f in dataclasses.fields(cls)}
-        kw = {k: (tuple(v) if k == "targets" else v) for k, v in d.items() if k in names}
+        kw = {k: (tuple(v) if k in ("targets", "offline_sources") else v) for k, v in d.items() if k in names}
         return cls(**kw)
 
     def structure(self) -> tuple:
@@ -245,7 +260,7 @@ class OfflineSource:
     with its source / view / cost weights when it has them, as the raw inputs the policy takes (after the dataset's repack
     transforms: "observation/..." keys + prompt -- what the inference node sends)."""
 
-    def __init__(self, policy, seed: int = 0):
+    def __init__(self, policy, sources=(), seed: int = 0, rlhf_dir: str = "", rlhf_share: float = 0.0):
         from openpi import transforms as _transforms
         from openpi.training import data_loader as _dl
 
@@ -257,21 +272,82 @@ class OfflineSource:
         self.dataset = _dl.create_torch_dataset(data_config, tc.model.action_horizon, tc.model)
         self.repack = _transforms.compose(data_config.repack_transforms.inputs)
         self.n = len(self.dataset)
-        self.p = None
-        if data_config.source_weights is not None:
-            w = _dl.source_weighted_sampler(data_config, self.n, seed).weights.numpy().astype(np.float64)
-            self.p = w / w.sum()
+        w = (_dl.source_weighted_sampler(data_config, self.n, seed).weights.numpy().astype(np.float64)
+             if data_config.source_weights is not None else np.ones(self.n))
+        self.sources = tuple(sources or ())
+        if self.sources:  # (frames of the other sources: weight 0)
+            from lerobot.common.datasets import lerobot_dataset
+
+            meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+            labels = json.loads((meta.root / "meta" / "episode_sources.json").read_text())
+            lengths = [meta.episodes[i]["length"] for i in range(meta.total_episodes)]
+            keep = np.concatenate([np.full(n, lab in self.sources) for n, lab in zip(lengths, labels)])
+            if len(keep) != self.n or not (w * keep).any():
+                raise ValueError(f"offline_sources {self.sources}: no frames of them in {self.repo_id} (its sources: {sorted(set(labels))})")
+            w = w * keep
+        self.p = w / w.sum()
         self.rng = np.random.default_rng(seed)
-        logging.info("LoRA RL offline decisions: frames of %s (%d, %s)", self.repo_id, self.n,
-                     "its training weights" if self.p is not None else "uniform")
+        logging.info("LoRA RL offline decisions: frames of %s (%d of %d, %s; %s)", self.repo_id, int((self.p > 0).sum()), self.n,
+                     f"sources {list(self.sources)}" if self.sources else "every source",
+                     "its training weights" if data_config.source_weights is not None else "uniform")
+        self.prompt = _np_tree(self.repack(self.dataset[int(np.flatnonzero(self.p)[0])])).get("prompt")
+        self.rlhf = self._load_rlhf(rlhf_dir) if rlhf_dir and rlhf_share > 0 else None
+        self.rlhf_share = float(rlhf_share) if self.rlhf else 0.0
+
+    @staticmethod
+    def _load_rlhf(rlhf_dir: str) -> dict | None:
+        """Every shard of rlhf_frames.py (224 x 224 JPEGs + state per past decision), concatenated."""
+        import glob
+
+        files = sorted(glob.glob(os.path.join(os.path.expanduser(rlhf_dir), "*.npz")))
+        if not files:
+            logging.warning("LoRA RL: no past RLHF frames in %s (rlhf_frames.py extract, then copy here): training-set frames only", rlhf_dir)
+            return None
+        parts = {k: [] for k in ("keys", "wrist", "env", "overhead", "state")}
+        for f in files:
+            z = np.load(f, allow_pickle=True)
+            for k in parts:
+                parts[k].append(z[k])
+        pool = {k: np.concatenate(v) for k, v in parts.items()}
+        logging.info("LoRA RL offline decisions: + %d past RLHF decisions from %d sessions (%s)", len(pool["keys"]), len(files), rlhf_dir)
+        return pool
+
+    def _rlhf_raw(self, j: int) -> dict:
+        """Past RLHF decision j as the inference node's raw inputs."""
+        import io
+
+        from PIL import Image
+
+        img = lambda b: np.asarray(Image.open(io.BytesIO(b)).convert("RGB"), dtype=np.uint8)
+        raw = {"observation/wrist_image": img(self.rlhf["wrist"][j]), "observation/env_image": img(self.rlhf["env"][j]),
+               "observation/overhead_image": img(self.rlhf["overhead"][j]), "observation/state": self.rlhf["state"][j].astype(np.float32),
+               "observation/env_image_valid": True}
+        if self.prompt is not None:
+            raw["prompt"] = self.prompt
+        return raw
+
+    def key(self, i: int) -> str:
+        """A frame id's origin: "train:<dataset index>" or the past decision's "session:seq"."""
+        return f"train:{i}" if i >= 0 else str(self.rlhf["keys"][-1 - i])
 
     def draw(self, k: int, indices=None) -> list[tuple[int, dict]]:
-        """k frames drawn with the training weights -- or these dataset indices."""
+        """k frames -- rlhf_share of them past RLHF decisions (uniform), the rest the training set with its weights -- or
+        these frame ids (>= 0: a dataset index; < 0: past RLHF decision -1 - id)."""
+        if indices is None:
+            n_rlhf = int(self.rng.binomial(k, self.rlhf_share)) if self.rlhf else 0
+            indices = list(self.rng.choice(self.n, size=k - n_rlhf, p=self.p)) + \
+                [-1 - int(j) for j in self.rng.integers(0, len(self.rlhf["keys"]), size=n_rlhf)] if self.rlhf else \
+                list(self.rng.choice(self.n, size=k, p=self.p))
+            self.rng.shuffle(indices)
         out = []
-        for i in (self.rng.choice(self.n, size=k, p=self.p) if indices is None else indices):
-            raw = _np_tree(self.repack(self.dataset[int(i)]))
+        for i in indices:
+            i = int(i)
+            if i < 0:
+                out.append((i, self._rlhf_raw(-1 - i)))
+                continue
+            raw = _np_tree(self.repack(self.dataset[i]))
             raw.pop("actions", None)
-            out.append((int(i), raw))
+            out.append((i, raw))
         return out
 
 
@@ -396,6 +472,34 @@ class LoRATrainer:
             self.records.pop(pending.pop(0).rl_id, None)
         return rl_id
 
+    def load_past_records(self) -> int:
+        """The replay buffer filled with the newest past live decisions saved under rl_dir (every session's records/: the
+        observation, the candidates and their critic rewards then), up to buffer_size. Their ratio reference is set at
+        their first update here, under the current policy. Returns how many."""
+        import glob
+
+        files = sorted(glob.glob(str(self.dir.parent / "*" / "records" / "rec_*.pt")), key=os.path.getmtime, reverse=True)
+        past = []
+        for f in files:
+            if len(past) + len(self.buffer) >= self.cfg.buffer_size:
+                break
+            try:
+                d = torch.load(f, map_location="cpu", weights_only=False)
+            except Exception:  # noqa: BLE001
+                continue
+            if d.get("offline") or d.get("rewards") is None:  # (live decisions only)
+                continue
+            rec = Record(self.next_id, d["obs"], np.asarray(d["actions"], np.float32), d.get("t", 0.0), d.get("version", -1),
+                         rewards=np.asarray(d["rewards"], np.float32), chosen=int(d.get("chosen", -1)), window=tuple(d.get("window", (0, 0))),
+                         dims=int(d.get("dims", 7)), meta={**(d.get("meta") or {}), "past": os.path.relpath(f, self.dir.parent)})
+            self.next_id += 1
+            if np.any(np.abs(self.advantages(rec)) > 1e-6):
+                past.append(rec)
+        self.buffer = past[::-1] + self.buffer  # (oldest first)
+        self._evict()
+        logging.info("LoRA RL: replay buffer filled with %d past live decisions (of %d saved records)", len(past), len(files))
+        return len(past)
+
     def _resolve(self, rl_id) -> Record:
         if rl_id in (None, "last", -1):
             if not self.records:
@@ -412,7 +516,8 @@ class LoRATrainer:
         every update): per frame its rl_id, the candidates in action units [N, H, d], the state and the wrist image (what
         the critic needs)."""
         if self.offline is None:
-            self.offline = OfflineSource(self.policy)
+            self.offline = OfflineSource(self.policy, self.cfg.offline_sources, rlhf_dir=self.cfg.rlhf_frames_dir,
+                                         rlhf_share=self.cfg.rlhf_frames_share)
         frames = []
         for i, raw in self.offline.draw(int(k), None if indices is None else [int(j) for j in indices]):
             obs = dict(raw)
@@ -427,7 +532,7 @@ class LoRATrainer:
                 self.records.pop(rl_id, None)
             else:
                 rec = self.records[rl_id]
-                rec.offline, rec.meta = purpose, {"frame": i}
+                rec.offline, rec.meta = purpose, {"frame": i, "origin": self.offline.key(i)}
             wrist = next((raw[k_] for k_ in ("observation/wrist_image", "wrist_image") if k_ in raw), None)
             state = next((raw[k_] for k_ in ("observation/state", "state") if k_ in raw), None)
             frames.append({"rl_id": int(rl_id), "frame": i, "actions": np.asarray(out["actions"], np.float32),
@@ -626,7 +731,7 @@ class LoRATrainer:
                 break
         self.opt.zero_grad(set_to_none=True)
         self.version += 1
-        path = self.save()
+        path = self.save() if self.version % max(1, cfg.save_every) == 0 or not self.last_saved else self.last_saved
         live = [r for r in self.buffer if not r.offline]
         mean = lambda v: float(np.mean(v)) if v else float("nan")
         metrics = {
@@ -723,7 +828,10 @@ class RLControl:
             if not os.path.exists(resume):
                 return {"success": False, "message": f"resume {resume}: not found on the server ({os.uname().nodename})"}
             t.load(resume)
+            if cfg.buffer_from_past:
+                t.load_past_records()
         t.set_enabled(bool(command.get("enabled", True)))
         return {"success": True, "version": t.version, "dir": str(t.dir), "host": os.uname().nodename, "fresh": fresh,
+                "buffer_decisions": sum(not r.offline for r in t.buffer),
                 "buffer_offline": sum(bool(r.offline) for r in t.buffer),
                 "trainable": int(sum(p.numel() for p in t.params)), "adapters": len(t.modules)}
